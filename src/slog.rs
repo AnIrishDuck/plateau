@@ -15,8 +15,10 @@
 //! Load is shed by failing any roll operation while an existing background
 //! write is pending. This signals the topic partition to discard writes and
 //! stall rolls until the write completes.
+use crate::manifest::SegmentData;
 use crate::segment::{Record, Segment};
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::cmp::{max, min};
 use std::fs;
 use std::ops::RangeInclusive;
@@ -24,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::sync::{mpsc, RwLock};
 
-pub type SlogWrites = mpsc::Receiver<(usize, u64)>;
+pub(crate) type SlogWrites = mpsc::Receiver<WriteResult>;
 
 /// A slog (segment log) is a named and ordered series of segments.
 pub(crate) struct Slog {
@@ -37,9 +39,22 @@ pub struct State {
     active: Vec<Record>,
     active_ix: usize,
     active_size: usize,
-    writer: mpsc::Sender<Vec<Record>>,
+    writer: mpsc::Sender<WriteRequest>,
     pending: Option<Vec<Record>>,
     time_range: Option<RangeInclusive<SystemTime>>,
+}
+
+struct WriteRequest {
+    segment: usize,
+    start: u128,
+    time: RangeInclusive<SystemTime>,
+    records: Vec<Record>,
+}
+
+#[derive(Debug)]
+pub(crate) struct WriteResult {
+    pub(crate) segment: usize,
+    pub(crate) data: SegmentData
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -53,7 +68,7 @@ impl Slog {
     //! commit events. The channel is bounded to a size of one; if it is not consumed,
     //! the writer thread will immediately stall.
     pub fn attach(root: PathBuf, name: String, active_ix: usize) -> (Self, SlogWrites) {
-        let (writer, rx) = spawn_slog_thread(root.clone(), name.clone(), active_ix);
+        let (writer, rx) = spawn_slog_thread(root.clone(), name.clone());
         let state = State {
             active_ix,
             active: vec![],
@@ -122,8 +137,8 @@ impl Slog {
         self.state.read().await.time_range.clone()
     }
 
-    pub(crate) async fn roll(&self) -> bool {
-        self.state.write().await.roll().await
+    pub(crate) async fn roll(&self, start: u128) -> bool {
+        self.state.write().await.roll(start).await
     }
 }
 
@@ -156,17 +171,27 @@ impl State {
         }
     }
 
-    pub(crate) async fn roll(&mut self) -> bool {
-        let ready = self.writer.try_send(self.active.clone());
+    pub(crate) async fn roll(&mut self, start: u128) -> bool {
+        if let Some(time_range) = &self.time_range {
+            dbg!(self.active_ix);
+            let ready = self.writer.try_send(WriteRequest {
+                segment: self.active_ix,
+                start,
+                time: time_range.clone(),
+                records: self.active.clone()
+            });
 
-        if ready.is_ok() {
-            self.pending = Some(std::mem::replace(&mut self.active, vec![]));
-            self.active_size = 0;
-            self.time_range = None;
-            self.active_ix += 1;
-            true
+            if ready.is_ok() {
+                self.pending = Some(std::mem::replace(&mut self.active, vec![]));
+                self.active_size = 0;
+                self.time_range = None;
+                self.active_ix += 1;
+                true
+            } else {
+                panic!("log overrun")
+            }
         } else {
-            panic!("log overrun")
+            panic!("cannot roll empty log");
         }
     }
 }
@@ -174,8 +199,7 @@ impl State {
 fn spawn_slog_thread(
     root: PathBuf,
     name: String,
-    mut current: usize,
-) -> (mpsc::Sender<Vec<Record>>, mpsc::Receiver<(usize, u64)>) {
+) -> (mpsc::Sender<WriteRequest>, SlogWrites) {
     let (tx, mut rx_records) = mpsc::channel(1);
     let (tx_done, rx) = mpsc::channel(1);
 
@@ -183,14 +207,22 @@ fn spawn_slog_thread(
         let mut active = true;
         while active {
             match rx_records.blocking_recv() {
-                Some(rs) => {
-                    let mut segment = Slog::segment_from_name(&root, &name, current).create();
-                    segment.log(rs);
-                    let size = segment.close();
+                Some(WriteRequest { segment, start, time, records }) => {
+                    let mut writer = Slog::segment_from_name(&root, &name, segment).create();
+                    let index = start..start + u128::try_from(records.len()).unwrap();
+                    writer.log(records);
+                    let size = usize::try_from(writer.close()).unwrap();
+                    let response = WriteResult {
+                        segment,
+                        data: SegmentData {
+                            index,
+                            time,
+                            size
+                        }
+                    };
                     tx_done
-                        .blocking_send((current, size))
+                        .blocking_send(response)
                         .expect("channel closed");
-                    current += 1;
                 }
                 None => active = false,
             }
@@ -222,17 +254,17 @@ mod test {
 
         let abc = slog.append(&records[0]).await;
         assert_eq!(slog.get_record(abc.clone()).await, Some(records[0].clone()));
-        slog.roll().await;
+        slog.roll(0).await;
         assert_eq!(
-            commits.recv().await.map(|(ix, size)| (ix, size > 0)),
-            Some((0, true))
+            commits.recv().await.map(|r| (r.data.index, r.data.size > 0)),
+            Some((0..1, true))
         );
         let def = slog.append(&records[1]).await;
         let ghi = slog.append(&records[2]).await;
-        slog.roll().await;
+        slog.roll(1).await;
         assert_eq!(
-            commits.recv().await.map(|(ix, size)| (ix, size > 0)),
-            Some((1, true))
+            commits.recv().await.map(|r| (r.data.index, r.data.size > 0)),
+            Some((1..3, true))
         );
 
         assert_eq!(slog.get_record(abc).await, Some(records[0].clone()));
