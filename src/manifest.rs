@@ -261,15 +261,14 @@ impl Manifest {
 
     async fn get_ordered_segment(&self, id: &PartitionId, order: &str) -> Option<SegmentIndex> {
         self.get_segment(
-            sqlx::query(
-            &format!(
+            sqlx::query(&format!(
                 "
                 SELECT segment_id FROM segments
                 WHERE topic = ?1 AND partition = ?2
                 ORDER BY segment_id {} LIMIT 1
-            ", order
-            )
-            )
+            ",
+                order
+            ))
             .bind(&id.topic)
             .bind(&id.partition),
         )
