@@ -1,3 +1,4 @@
+mod manifest;
 mod segment;
 mod slog;
 
