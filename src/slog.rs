@@ -91,10 +91,7 @@ impl Slog {
         state.get_record(ix.clone()).await.or_else(|| {
             let segment = self.get_segment(ix.segment);
             if Path::new(segment.path()).exists() {
-                segment.read()
-                    .read_all()
-                    .get(ix.record)
-                    .cloned()
+                segment.read().read_all().get(ix.record).cloned()
             } else {
                 None
             }
@@ -154,15 +151,13 @@ impl State {
                 Some(pending) if ix.segment + 1 == self.active_ix => {
                     pending.get(ix.record).cloned()
                 }
-                _ => None
+                _ => None,
             }
         }
     }
 
     pub(crate) async fn roll(&mut self) -> bool {
-        let ready = self
-            .writer
-            .try_send(self.active.clone());
+        let ready = self.writer.try_send(self.active.clone());
 
         if ready.is_ok() {
             self.pending = Some(std::mem::replace(&mut self.active, vec![]));
@@ -176,7 +171,11 @@ impl State {
     }
 }
 
-fn spawn_slog_thread(root: PathBuf, name: String, mut current: usize) -> (mpsc::Sender<Vec<Record>>, mpsc::Receiver<(usize, u64)>) {
+fn spawn_slog_thread(
+    root: PathBuf,
+    name: String,
+    mut current: usize,
+) -> (mpsc::Sender<Vec<Record>>, mpsc::Receiver<(usize, u64)>) {
     let (tx, mut rx_records) = mpsc::channel(1);
     let (tx_done, rx) = mpsc::channel(1);
 
@@ -188,7 +187,9 @@ fn spawn_slog_thread(root: PathBuf, name: String, mut current: usize) -> (mpsc::
                     let mut segment = Slog::segment_from_name(&root, &name, current).create();
                     segment.log(rs);
                     let size = segment.close();
-                    tx_done.blocking_send((current, size)).expect("channel closed");
+                    tx_done
+                        .blocking_send((current, size))
+                        .expect("channel closed");
                     current += 1;
                 }
                 None => active = false,
@@ -209,7 +210,8 @@ mod test {
     #[tokio::test]
     async fn basic_sequencing() {
         let root = tempdir().unwrap();
-        let (slog, mut commits) = Slog::attach(PathBuf::from(root.path()), String::from("testing"), 0);
+        let (slog, mut commits) =
+            Slog::attach(PathBuf::from(root.path()), String::from("testing"), 0);
         let records: Vec<_> = vec!["abc", "def", "ghi"]
             .into_iter()
             .map(|message| Record {
