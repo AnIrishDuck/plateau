@@ -15,25 +15,31 @@
 //! Load is shed by failing any roll operation while an existing background
 //! write is pending. This signals the topic partition to discard writes and
 //! stall rolls until the write completes.
-use crate::segment::{Record, Segment, SegmentWriter};
+use crate::segment::{Record, Segment};
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::fs;
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
-use std::sync::{mpsc, Mutex};
-use std::thread::{spawn, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use tokio::sync::{mpsc, RwLock};
+
+pub type SlogWrites = mpsc::Receiver<(usize, u64)>;
 
 /// A slog (segment log) is a named and ordered series of segments.
 pub(crate) struct Slog {
     root: PathBuf,
     name: String,
-    current: usize,
-    pending: Vec<Record>,
-    pending_size: usize,
+    state: RwLock<State>,
+}
+
+pub struct State {
+    active: Vec<Record>,
+    active_ix: usize,
+    active_size: usize,
+    writer: mpsc::Sender<Vec<Record>>,
+    pending: Option<Vec<Record>>,
     time_range: Option<RangeInclusive<SystemTime>>,
-    writer: SlogThreadControl,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -43,17 +49,27 @@ pub struct Index {
 }
 
 impl Slog {
-    pub fn attach(root: PathBuf, name: String, current: usize) -> Self {
-        let writer = SlogThread::spawn(root.clone(), name.clone(), current);
-        Slog {
+    //! Because a slog is stateless, whatever attaches it is responsible for processing
+    //! commit events. The channel is bounded to a size of one; if it is not consumed,
+    //! the writer thread will immediately stall.
+    pub fn attach(root: PathBuf, name: String, active_ix: usize) -> (Self, SlogWrites) {
+        let (writer, rx) = spawn_slog_thread(root.clone(), name.clone(), active_ix);
+        let state = State {
+            active_ix,
+            active: vec![],
+            active_size: 0,
+            pending: None,
+            time_range: None,
+            writer,
+        };
+
+        let slog = Slog {
             root,
             name,
-            current,
-            writer,
-            pending: vec![],
-            pending_size: 0,
-            time_range: None,
-        }
+            state: RwLock::new(state),
+        };
+
+        (slog, rx)
     }
 
     fn segment_path(root: &PathBuf, name: &str, segment_ix: usize) -> PathBuf {
@@ -69,164 +85,118 @@ impl Slog {
         Slog::segment_from_name(&self.root, &self.name, segment_ix)
     }
 
-    pub(crate) fn get_record(&self, ix: Index) -> Option<Record> {
-        assert!(ix.segment <= self.current);
-        if ix.segment == self.current {
-            self.pending.get(ix.record).cloned()
-        } else {
-            self.get_segment(ix.segment)
-                .read()
-                .read_all()
-                .get(ix.record)
-                .cloned()
-        }
+    pub(crate) async fn get_record(&self, ix: Index) -> Option<Record> {
+        let state = self.state.read().await;
+        assert!(ix.segment <= state.active_ix);
+        state.get_record(ix.clone()).await.or_else(|| {
+            let segment = self.get_segment(ix.segment);
+            if Path::new(segment.path()).exists() {
+                segment.read()
+                    .read_all()
+                    .get(ix.record)
+                    .cloned()
+            } else {
+                None
+            }
+        })
     }
 
-    pub(crate) fn append(&mut self, r: &Record) -> Index {
-        let record = self.pending.len();
-        self.pending_size += r.message.len();
-        self.pending.push(r.clone());
-        self.time_range = self
-            .time_range
-            .clone()
-            .map(|range| (min(*range.start(), r.time)..=max(*range.end(), r.time)))
-            .or(Some(r.time..=r.time));
-        Index {
-            segment: self.current,
-            record,
-        }
+    pub(crate) async fn append(&self, r: &Record) -> Index {
+        self.state.write().await.append(r).await
     }
 
     pub(crate) fn destroy(&self, segment_ix: usize) {
         fs::remove_file(Slog::segment_path(&self.root, &self.name, segment_ix)).unwrap()
     }
 
-    pub(crate) fn current_segment_ix(&self) -> usize {
-        self.current
+    pub(crate) async fn current_segment_ix(&self) -> usize {
+        self.state.read().await.active_ix
     }
 
-    pub(crate) fn current_len(&self) -> usize {
-        self.pending.len()
+    pub(crate) async fn current_len(&self) -> usize {
+        self.state.read().await.active.len()
     }
 
-    pub(crate) fn current_size(&self) -> usize {
-        self.pending_size
+    pub(crate) async fn current_size(&self) -> usize {
+        self.state.read().await.active_size
     }
 
-    pub(crate) fn current_time_range(&self) -> Option<RangeInclusive<SystemTime>> {
-        self.time_range.clone()
+    pub(crate) async fn current_time_range(&self) -> Option<RangeInclusive<SystemTime>> {
+        self.state.read().await.time_range.clone()
     }
 
-    pub(crate) fn roll(&mut self) -> Option<(usize, u64)> {
-        let (ready, data) = self
+    pub(crate) async fn roll(&self) -> bool {
+        self.state.write().await.roll().await
+    }
+}
+
+impl State {
+    pub(crate) async fn append(&mut self, r: &Record) -> Index {
+        let record = self.active.len();
+        self.active_size += r.message.len();
+        self.active.push(r.clone());
+        self.time_range = self
+            .time_range
+            .clone()
+            .map(|range| (min(*range.start(), r.time)..=max(*range.end(), r.time)))
+            .or(Some(r.time..=r.time));
+        Index {
+            segment: self.active_ix,
+            record,
+        }
+    }
+
+    pub(crate) async fn get_record(&self, ix: Index) -> Option<Record> {
+        if ix.segment == self.active_ix {
+            self.active.get(ix.record).cloned()
+        } else {
+            match &self.pending {
+                Some(pending) if ix.segment + 1 == self.active_ix => {
+                    pending.get(ix.record).cloned()
+                }
+                _ => None
+            }
+        }
+    }
+
+    pub(crate) async fn roll(&mut self) -> bool {
+        let ready = self
             .writer
-            .try_send(std::mem::replace(&mut self.pending, vec![]));
-        if ready {
-            self.pending_size = 0;
+            .try_send(self.active.clone());
+
+        if ready.is_ok() {
+            self.pending = Some(std::mem::replace(&mut self.active, vec![]));
+            self.active_size = 0;
             self.time_range = None;
-            self.current += 1;
-            data
+            self.active_ix += 1;
+            true
         } else {
             panic!("log overrun")
         }
     }
-
-    pub(crate) fn commit(&mut self) -> Option<(usize, u64)> {
-        self.writer.commit()
-    }
 }
 
-struct SlogThread {
-    writer: SegmentWriter,
-}
+fn spawn_slog_thread(root: PathBuf, name: String, mut current: usize) -> (mpsc::Sender<Vec<Record>>, mpsc::Receiver<(usize, u64)>) {
+    let (tx, mut rx_records) = mpsc::channel(1);
+    let (tx_done, rx) = mpsc::channel(1);
 
-enum SlogThreadMessage {
-    Write(Vec<Record>),
-    Close,
-}
-
-struct SlogThreadControl {
-    write_handle: JoinHandle<()>,
-    ready: bool,
-    tx: Mutex<mpsc::Sender<SlogThreadMessage>>,
-    rx: Mutex<mpsc::Receiver<(usize, u64)>>,
-}
-
-impl SlogThreadControl {
-    fn try_send(&mut self, rs: Vec<Record>) -> (bool, Option<(usize, u64)>) {
-        let mut size_data = None;
-        if !self.ready {
-            match self
-                .rx
-                .lock()
-                .expect("rx lock")
-                .recv_timeout(Duration::from_millis(1000))
-            {
-                Ok(data) => {
-                    self.ready = true;
-                    size_data = Some(data)
+    std::thread::spawn(move || {
+        let mut active = true;
+        while active {
+            match rx_records.blocking_recv() {
+                Some(rs) => {
+                    let mut segment = Slog::segment_from_name(&root, &name, current).create();
+                    segment.log(rs);
+                    let size = segment.close();
+                    tx_done.blocking_send((current, size)).expect("channel closed");
+                    current += 1;
                 }
-                Err(_) => return (false, None),
+                None => active = false,
             }
         }
-        self.tx
-            .lock()
-            .expect("tx lock")
-            .send(SlogThreadMessage::Write(rs))
-            .expect("sending record batch");
-        self.ready = false;
-        (true, size_data)
-    }
+    });
 
-    fn commit(&mut self) -> Option<(usize, u64)> {
-        if !self.ready {
-            let data = self.rx.lock().expect("rx lock").recv().unwrap();
-            self.ready = true;
-            Some(data)
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for SlogThreadControl {
-    fn drop(&mut self) {
-        self.tx
-            .lock()
-            .expect("tx lock")
-            .send(SlogThreadMessage::Close)
-            .expect("send writer thread shutdown");
-    }
-}
-
-impl SlogThread {
-    fn spawn(root: PathBuf, name: String, mut current: usize) -> SlogThreadControl {
-        let (tx, rx_records) = mpsc::channel();
-        let (tx_done, rx) = mpsc::channel();
-
-        let write_handle = spawn(move || {
-            let mut active = true;
-            while active {
-                let mut segment = Slog::segment_from_name(&root, &name, current).create();
-                match rx_records.recv().unwrap() {
-                    SlogThreadMessage::Write(rs) => {
-                        segment.log(rs);
-                        let size = segment.close();
-                        tx_done.send((current, size)).unwrap();
-                        current += 1;
-                    }
-                    SlogThreadMessage::Close => active = false,
-                }
-            }
-        });
-
-        SlogThreadControl {
-            write_handle,
-            ready: true,
-            tx: Mutex::new(tx),
-            rx: Mutex::new(rx),
-        }
-    }
+    (tx, rx)
 }
 
 mod test {
@@ -236,10 +206,10 @@ mod test {
     use std::time::SystemTime;
     use tempfile::tempdir;
 
-    #[test]
-    fn basic_sequencing() {
+    #[tokio::test]
+    async fn basic_sequencing() {
         let root = tempdir().unwrap();
-        let mut slog = Slog::attach(PathBuf::from(root.path()), String::from("testing"), 0);
+        let (slog, mut commits) = Slog::attach(PathBuf::from(root.path()), String::from("testing"), 0);
         let records: Vec<_> = vec!["abc", "def", "ghi"]
             .into_iter()
             .map(|message| Record {
@@ -248,24 +218,23 @@ mod test {
             })
             .collect();
 
-        let abc = slog.append(&records[0]);
-        assert_eq!(slog.get_record(abc.clone()), Some(records[0].clone()));
-        slog.roll();
+        let abc = slog.append(&records[0]).await;
+        assert_eq!(slog.get_record(abc.clone()).await, Some(records[0].clone()));
+        slog.roll().await;
         assert_eq!(
-            slog.commit().map(|(ix, size)| (ix, size > 0)),
+            commits.recv().await.map(|(ix, size)| (ix, size > 0)),
             Some((0, true))
         );
-        let def = slog.append(&records[1]);
-        let ghi = slog.append(&records[2]);
-        slog.roll();
+        let def = slog.append(&records[1]).await;
+        let ghi = slog.append(&records[2]).await;
+        slog.roll().await;
         assert_eq!(
-            slog.commit().map(|(ix, size)| (ix, size > 0)),
+            commits.recv().await.map(|(ix, size)| (ix, size > 0)),
             Some((1, true))
         );
-        assert_eq!(slog.commit(), None);
 
-        assert_eq!(slog.get_record(abc), Some(records[0].clone()));
-        assert_eq!(slog.get_record(def), Some(records[1].clone()));
-        assert_eq!(slog.get_record(ghi), Some(records[2].clone()));
+        assert_eq!(slog.get_record(abc).await, Some(records[0].clone()));
+        assert_eq!(slog.get_record(def).await, Some(records[1].clone()));
+        assert_eq!(slog.get_record(ghi).await, Some(records[2].clone()));
     }
 }
