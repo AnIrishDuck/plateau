@@ -1,4 +1,5 @@
 mod manifest;
+mod partition;
 mod segment;
 mod slog;
 
