@@ -8,6 +8,7 @@ edition = "2018"
 [dependencies]
 futures = "*"
 log = "0.4"
+openssl = { version = "*", features = ["vendored"] }
 parquet = "5.5"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
