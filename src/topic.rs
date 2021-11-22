@@ -90,6 +90,16 @@ impl Topic {
         partition.get_record_by_index(index).await
     }
 
+    pub(crate) async fn get_records(
+        &self,
+        partition_name: &str,
+        start: RecordIndex,
+        limit: usize,
+    ) -> (Range<RecordIndex>, Vec<Record>) {
+        let partition = self.get_partition(partition_name).await;
+        partition.get_records(start, limit).await
+    }
+
     pub async fn commit(&self) {
         for (_, part) in self.partitions.read().await.iter() {
             part.commit().await;

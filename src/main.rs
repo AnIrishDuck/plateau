@@ -44,8 +44,19 @@ struct Inserted {
 
 #[derive(Schema, Serialize)]
 struct Records {
+    span: Span,
     records: Vec<String>,
 }
+
+#[derive(Deserialize)]
+struct RecordQuery {
+    start: usize,
+    limit: Option<usize>,
+}
+
+#[derive(Debug)]
+struct InvalidQuery;
+impl warp::reject::Reject for InvalidQuery {}
 
 #[tokio::main]
 async fn main() {
@@ -92,4 +103,27 @@ async fn topic_append(
     Ok(Json::from(Inserted {
         span: Span::from_range(r),
     }))
+}
+
+#[get("/topic/{topic_name}/{partition_name}/records")]
+#[openapi(id = "topic.get_records")]
+async fn topic_get_records(
+    topic_name: String,
+    partition_name: String,
+    #[query] query: String,
+    #[data] catalog: Catalog,
+) -> Result<Json<Records>, Rejection> {
+    if let Ok(q) = serde_json::from_str::<RecordQuery>(&query) {
+        let topic = catalog.get_topic(&topic_name).await;
+        let limit = std::cmp::min(q.limit.unwrap_or(1000), 10000);
+        let (range, rs) = topic
+            .get_records(&partition_name, RecordIndex(q.start), limit)
+            .await;
+        Ok(Json::from(Records {
+            span: Span::from_range(range),
+            records: vec![],
+        }))
+    } else {
+        Err(rweb::reject::custom(InvalidQuery {}))
+    }
 }

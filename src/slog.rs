@@ -17,6 +17,9 @@
 //! stall rolls until the write completes.
 use crate::manifest::SegmentData;
 use crate::segment::{Record, Segment};
+use futures::future::FutureExt;
+use futures::stream::StreamExt;
+use futures::{future, stream, Stream};
 use std::cmp::{max, min};
 use std::convert::TryFrom;
 use std::fs;
@@ -131,14 +134,33 @@ impl Slog {
     }
 
     pub(crate) async fn get_record(&self, ix: Index) -> Option<Record> {
+        self.get_records_for_segment(ix.segment)
+            .await
+            .get(ix.record.0)
+            .cloned()
+    }
+
+    pub(crate) fn segment_stream(
+        &self,
+        start: SegmentIndex,
+    ) -> impl Stream<Item = Vec<Record>> + '_ {
+        stream::iter(start.0..)
+            .flat_map(move |segment| {
+                self.get_records_for_segment(SegmentIndex(segment))
+                    .into_stream()
+            })
+            .take_while(|rs| future::ready(rs.len() > 0))
+    }
+
+    pub(crate) async fn get_records_for_segment(&self, ix: SegmentIndex) -> Vec<Record> {
         let state = self.state.read().await;
-        assert!(ix.segment <= state.active_ix);
-        state.get_record(ix.clone()).await.or_else(|| {
-            let segment = self.get_segment(ix.segment);
+        assert!(ix <= state.active_ix);
+        state.get_segment(ix).await.cloned().unwrap_or_else(|| {
+            let segment = self.get_segment(ix);
             if Path::new(segment.path()).exists() {
-                segment.read().read_all().get(ix.record.0).cloned()
+                segment.read().read_all()
             } else {
-                None
+                vec![]
             }
         })
     }
@@ -188,17 +210,21 @@ impl State {
         }
     }
 
-    pub(crate) async fn get_record(&self, ix: Index) -> Option<Record> {
-        if ix.segment == self.active_ix {
-            self.active.get(ix.record.0).cloned()
+    async fn get_segment(&self, ix: SegmentIndex) -> Option<&Vec<Record>> {
+        if ix == self.active_ix {
+            Some(&self.active)
         } else {
             match &self.pending {
-                Some(pending) if ix.segment.next() == self.active_ix => {
-                    pending.get(ix.record.0).cloned()
-                }
+                Some(pending) if ix.next() == self.active_ix => self.pending.as_ref(),
                 _ => None,
             }
         }
+    }
+
+    pub(crate) async fn get_record(&self, ix: Index) -> Option<Record> {
+        self.get_segment(ix.segment)
+            .await
+            .and_then(|rs| rs.get(ix.record.0).cloned())
     }
 
     pub(crate) async fn roll(&mut self, start: RecordIndex) -> bool {

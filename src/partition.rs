@@ -22,6 +22,7 @@ pub use crate::segment::Record;
 pub use crate::slog::{Index, RecordIndex};
 use crate::slog::{SegmentIndex, SegmentRecordIndex, Slog};
 use futures::future::OptionFuture;
+use futures::stream::StreamExt;
 use futures::FutureExt;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -147,11 +148,11 @@ impl Partition {
         self.state.write().await.commit(&self).await;
     }
 
-    pub(crate) async fn get_record_by_index(&self, index: RecordIndex) -> Option<Record> {
+    pub(crate) async fn get_record_full_index(&self, index: RecordIndex) -> Option<Index> {
         let state = self.state.read().await;
         let open = state.open_index;
         let manifest = &self.manifest;
-        let slog_index = if index >= open {
+        if index >= open {
             Some(Index {
                 record: SegmentRecordIndex(index.0 - open.0),
                 segment: state.messages.current_segment_ix().await,
@@ -170,8 +171,36 @@ impl Partition {
                     }))
                 })
                 .await
-        };
+        }
+    }
 
+    pub(crate) async fn get_records(
+        &self,
+        start: RecordIndex,
+        limit: usize,
+    ) -> (Range<RecordIndex>, Vec<Record>) {
+        let state = self.state.read().await;
+        let full = self.get_record_full_index(start).await;
+        let records = if let Some(extant) = full {
+            use futures::stream;
+            state
+                .messages
+                .segment_stream(extant.segment)
+                .flat_map(|rs| stream::iter(rs))
+                .skip(extant.record.0)
+                .take(limit)
+                .collect()
+                .await
+        } else {
+            vec![]
+        };
+        let range = start..RecordIndex(start.0 + records.len());
+        (range, records)
+    }
+
+    pub(crate) async fn get_record_by_index(&self, index: RecordIndex) -> Option<Record> {
+        let state = self.state.read().await;
+        let slog_index = self.get_record_full_index(index).await;
         OptionFuture::from(slog_index.map(|ix| state.messages.get_record(ix)))
             .await
             .flatten()
@@ -367,6 +396,15 @@ mod test {
             t.get_record_by_index(RecordIndex(records.len())).await,
             None
         );
+
+        for (start, limit) in (0..records.len()).zip(0..records.len()) {
+            let range = start..std::cmp::min(start + limit, records.len());
+            let slice = Vec::from(&records[range.clone()]);
+            assert_eq!(
+                t.get_records(RecordIndex(start), limit).await,
+                (RecordIndex(range.start)..RecordIndex(range.end), slice)
+            );
+        }
     }
 
     #[tokio::test]
