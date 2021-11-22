@@ -26,6 +26,7 @@ use futures::FutureExt;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, RwLock};
@@ -131,7 +132,7 @@ impl Partition {
         format!("{}-{}", id.topic(), id.partition())
     }
 
-    pub(crate) async fn append(&self, rs: &[Record]) -> Option<RecordIndex> {
+    pub(crate) async fn append(&self, rs: &[Record]) -> Range<RecordIndex> {
         let mut state = self.state.write().await;
         let start = state.open_index;
         for r in rs {
@@ -139,11 +140,7 @@ impl Partition {
             state.roll_when_needed(&self).await;
         }
 
-        if rs.len() > 0 {
-            Some(RecordIndex(start.0 + rs.len()))
-        } else {
-            None
-        }
+        start..RecordIndex(start.0 + rs.len())
     }
 
     pub(crate) async fn commit(&self) {

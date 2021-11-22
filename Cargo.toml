@@ -10,13 +10,14 @@ futures = "*"
 log = "0.4"
 openssl = { version = "*", features = ["vendored"] }
 parquet = "5.5"
+pretty_env_logger = "0.4"
+rweb = { version = "0.6", features = ["openapi"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.2"
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.5.9", features = [ "chrono", "sqlite", "runtime-tokio-native-tls" ] }
-warp = "0.3"
 
 [dev-dependencies]
 itermore = "0.1"
