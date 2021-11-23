@@ -43,6 +43,11 @@ struct Inserted {
 }
 
 #[derive(Schema, Serialize)]
+struct Partitions {
+    partitions: Vec<String>,
+}
+
+#[derive(Schema, Serialize)]
 struct Records {
     span: Span,
     records: Vec<String>,
@@ -102,6 +107,18 @@ async fn topic_append(
 
     Ok(Json::from(Inserted {
         span: Span::from_range(r),
+    }))
+}
+
+#[get("/topic/{topic_name}")]
+#[openapi(id = "topic.get_partitions")]
+async fn topic_get_partitions(
+    topic_name: String,
+    #[data] catalog: Catalog,
+) -> Result<Json<Partitions>, Rejection> {
+    let topic = catalog.get_topic(&topic_name).await;
+    Ok(Json::from(Partitions {
+        partitions: topic.get_partitions().await,
     }))
 }
 

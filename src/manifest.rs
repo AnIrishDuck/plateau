@@ -319,6 +319,21 @@ impl Manifest {
         .flatten()
     }
 
+    /// Get all partitions for a given topic.
+    pub async fn get_partitions(&self, topic: &str) -> Vec<String> {
+        sqlx::query(
+            "
+            SELECT DISTINCT partition FROM segments
+            WHERE topic = ?1
+        ",
+        )
+        .bind(topic)
+        .map(|row: SqliteRow| row.get::<String, _>(0))
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// Find the "open index" of a given partition.
     /// The open index is the lowest index for a record that is not durably
     /// stored on disk.
@@ -336,6 +351,7 @@ impl Manifest {
 
 mod test {
     use super::*;
+    use std::collections::HashSet;
     use std::time::SystemTime;
     use tempfile::tempdir;
 
@@ -440,6 +456,19 @@ mod test {
                 },
             )
             .await;
+
+        assert_eq!(state.get_size(&a).await, Some(35));
+        assert_eq!(state.get_size(&b).await, Some(12));
+        assert_eq!(
+            state
+                .get_partitions(a.topic())
+                .await
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            vec![String::from("a"), String::from("b")]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
     }
 
     #[tokio::test]
