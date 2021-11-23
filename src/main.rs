@@ -10,8 +10,10 @@ use parquet::data_type::ByteArray;
 use rweb::*;
 use serde::{Deserialize, Serialize};
 use slog::RecordIndex;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::catalog::Catalog;
@@ -44,7 +46,7 @@ struct Inserted {
 
 #[derive(Schema, Serialize)]
 struct Partitions {
-    partitions: Vec<String>,
+    partitions: HashMap<Arc<String>, Span>,
 }
 
 #[derive(Schema, Serialize)]
@@ -118,7 +120,12 @@ async fn topic_get_partitions(
 ) -> Result<Json<Partitions>, Rejection> {
     let topic = catalog.get_topic(&topic_name).await;
     Ok(Json::from(Partitions {
-        partitions: topic.get_partitions().await,
+        partitions: topic
+            .get_indices()
+            .await
+            .into_iter()
+            .map(|(partition, range)| (Arc::new(partition), Span::from_range(range)))
+            .collect(),
     }))
 }
 

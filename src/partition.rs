@@ -198,8 +198,10 @@ impl Partition {
         let range_end = RecordIndex(start.0 + records.len());
         let partition_start = self
             .manifest
-            .get_min_record_id(&self.id)
+            .get_partition_indices(self.id.topic())
             .await
+            .get(self.id.partition())
+            .map(|r| r.start)
             .unwrap_or(RecordIndex(0));
         let end = std::cmp::max(range_end, partition_start);
         (start..end, records)

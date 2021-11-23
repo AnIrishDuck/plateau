@@ -394,7 +394,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fc25a87fa4fd2094bffb06925852034d90a17f0d1e05197d4956d3555752191"
 dependencies = [
  "matches",
- "percent-encoding 2.1.0",
+ "percent-encoding",
 ]
 
 [[package]]
@@ -685,17 +685,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "want",
-]
-
-[[package]]
-name = "idna"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38f09e0f0b1fb55fdee1f17470ad800da77af5186a1a76c026b679358b7e844e"
-dependencies = [
- "matches",
- "unicode-bidi",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -1206,12 +1195,6 @@ dependencies = [
 
 [[package]]
 name = "percent-encoding"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31010dd2e1ac33d5b46a5b413495239882813e0369f8ed8a5e266f173602f831"
-
-[[package]]
-name = "percent-encoding"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4fd5641d01c8f18a23da7b6fe29298ff4b55afcccdf78973b24cf3175fee32e"
@@ -1460,15 +1443,15 @@ dependencies = [
 
 [[package]]
 name = "rweb"
-version = "0.6.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97476ce64cc8d26699f7bdab47cedf654b73bafc5a62779920ea216d041ffa3e"
+checksum = "21f1933441e6a941be1989b5583fac7e2175a3acff6b60b93f6fb566d50bb2e3"
 dependencies = [
  "futures",
  "http",
  "indexmap",
  "rweb-macros",
- "rweb-openapi",
+ "rweb-openapi 0.7.0",
  "scoped-tls",
  "serde",
  "serde_json",
@@ -1479,28 +1462,39 @@ dependencies = [
 
 [[package]]
 name = "rweb-macros"
-version = "0.5.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bafed2d5f97be7f9102ef7a197d222bea394630061b060a89ef284dd7b906585"
+checksum = "8340390c0d2adb01a60d26fe4a5df5b0438c79072d25708a9a043177bcd74c2c"
 dependencies = [
  "pmutil",
  "proc-macro2",
  "quote",
- "rweb-openapi",
+ "rweb-openapi 0.6.0",
  "syn",
 ]
 
 [[package]]
 name = "rweb-openapi"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b632445f4b9413a8beaa0f1e66397a0cba3fe8f18410b52608cd6c48225817f3"
+checksum = "d0f3187ee05c7f920477357885f683e5c29bdf024f7873d8e2aa23930c07de29"
 dependencies = [
  "indexmap",
  "serde",
  "serde_json",
- "url 1.7.2",
- "url_serde",
+ "url",
+]
+
+[[package]]
+name = "rweb-openapi"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64942b89e6a87dacd3e870163acd2508bfb2845483359aa06a894b4de0320c6d"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -1719,7 +1713,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "parking_lot",
- "percent-encoding 2.1.0",
+ "percent-encoding",
  "sha2",
  "smallvec",
  "sqlformat",
@@ -1727,7 +1721,7 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tokio-stream",
- "url 2.2.2",
+ "url",
  "whoami",
 ]
 
@@ -1747,7 +1741,7 @@ dependencies = [
  "sqlx-core",
  "sqlx-rt",
  "syn",
- "url 2.2.2",
+ "url",
 ]
 
 [[package]]
@@ -2006,7 +2000,7 @@ dependencies = [
  "log",
  "rand 0.8.4",
  "sha-1",
- "url 2.2.2",
+ "url",
  "utf-8",
 ]
 
@@ -2069,35 +2063,15 @@ checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
 
 [[package]]
 name = "url"
-version = "1.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd4e7c0d531266369519a4aa4f399d748bd37043b00bde1e4ff1f60a120b355a"
-dependencies = [
- "idna 0.1.5",
- "matches",
- "percent-encoding 1.0.1",
-]
-
-[[package]]
-name = "url"
 version = "2.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a507c383b2d33b5fc35d1861e77e6b383d158b2da5e14fe51b83dfedf6fd578c"
 dependencies = [
  "form_urlencoded",
- "idna 0.2.3",
+ "idna",
  "matches",
- "percent-encoding 2.1.0",
-]
-
-[[package]]
-name = "url_serde"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74e7d099f1ee52f823d4bdd60c93c3602043c728f5db3b97bdb548467f7bddea"
-dependencies = [
+ "percent-encoding",
  "serde",
- "url 1.7.2",
 ]
 
 [[package]]
@@ -2143,7 +2117,7 @@ dependencies = [
  "mime",
  "mime_guess",
  "multipart",
- "percent-encoding 2.1.0",
+ "percent-encoding",
  "pin-project",
  "scoped-tls",
  "serde",

@@ -49,8 +49,8 @@ impl Topic {
         root.join(name)
     }
 
-    pub async fn get_partitions(&self) -> Vec<String> {
-        self.manifest.get_partitions(&self.name).await
+    pub async fn get_indices(&self) -> HashMap<String, Range<RecordIndex>> {
+        self.manifest.get_partition_indices(&self.name).await
     }
 
     async fn get_partition(&self, partition_name: &str) -> RwLockReadGuard<'_, Partition> {
@@ -116,6 +116,7 @@ mod test {
     use parquet::data_type::ByteArray;
     use std::collections::HashSet;
     use std::convert::TryFrom;
+    use std::iter::FromIterator;
     use std::ops::Deref;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
@@ -166,15 +167,12 @@ mod test {
         )
         .await;
         assert_eq!(
-            topic
-                .get_partitions()
-                .await
-                .into_iter()
-                .collect::<HashSet<_>>(),
-            vec!["partition-0", "partition-1", "partition-2"]
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect::<HashSet<_>>()
+            topic.get_indices().await,
+            HashMap::<_, _>::from_iter([
+                ("partition-0".to_string(), RecordIndex(0)..RecordIndex(2)),
+                ("partition-1".to_string(), RecordIndex(0)..RecordIndex(2)),
+                ("partition-2".to_string(), RecordIndex(0)..RecordIndex(2)),
+            ])
         );
     }
 
