@@ -194,8 +194,15 @@ impl Partition {
         } else {
             vec![]
         };
-        let range = start..RecordIndex(start.0 + records.len());
-        (range, records)
+
+        let range_end = RecordIndex(start.0 + records.len());
+        let partition_start = self
+            .manifest
+            .get_min_record_id(&self.id)
+            .await
+            .unwrap_or(RecordIndex(0));
+        let end = std::cmp::max(range_end, partition_start);
+        (start..end, records)
     }
 
     pub(crate) async fn get_record_by_index(&self, index: RecordIndex) -> Option<Record> {
@@ -228,10 +235,15 @@ impl Partition {
                 .await
                 .unwrap_or(SegmentIndex(0));
             info!("over limit {}: {:?}..={:?}", self.id, min, max);
-            return max.0 - min.0 > count;
+            return (max.0 - min.0 + 1) > count;
         }
 
         false
+    }
+
+    pub(crate) async fn compact(&self) {
+        let mut state = self.state.write().await;
+        state.retain(&self).await;
     }
 }
 
@@ -468,5 +480,65 @@ mod test {
                 None
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_after_compaction() {
+        let id = PartitionId::new("topic", "testing-roll");
+        let dir = tempdir().unwrap();
+        let root = PathBuf::from(dir.path());
+        let manifest = Manifest::attach(root.join("manifest.sqlite")).await;
+        let t = Partition::attach(
+            root,
+            manifest,
+            id,
+            Config {
+                roll: Rolling {
+                    max_segment_index: 2,
+                    ..Rolling::default()
+                },
+                retain: Retention {
+                    max_segment_count: Some(1),
+                    ..Retention::default()
+                },
+            },
+        )
+        .await;
+
+        let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
+            .into_iter()
+            .map(|message| Record {
+                time: SystemTime::UNIX_EPOCH,
+                message: ByteArray::from(message),
+            })
+            .collect();
+
+        for record in records.iter() {
+            t.append(&vec![record.clone()]).await;
+        }
+        t.commit().await;
+
+        // this compaction will destroy the first segment
+        t.compact().await;
+
+        assert_eq!(
+            t.get_records(RecordIndex(0), 2).await,
+            (RecordIndex(0)..RecordIndex(3), vec![])
+        );
+        assert_eq!(
+            t.get_records(RecordIndex(3), 2).await,
+            (
+                RecordIndex(3)..RecordIndex(5),
+                vec![records[3].clone(), records[4].clone()]
+            )
+        );
+        assert_eq!(
+            t.get_records(RecordIndex(5), 2).await,
+            (RecordIndex(5)..RecordIndex(6), vec![records[5].clone(),])
+        );
+        assert_eq!(
+            t.get_records(RecordIndex(6), 2).await,
+            (RecordIndex(6)..RecordIndex(6), vec![])
+        );
     }
 }

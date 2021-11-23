@@ -106,6 +106,11 @@ fn row_to_option_segment(row: SqliteRow) -> Option<SegmentIndex> {
         .map(|v| SegmentIndex(usize::try_from(v).unwrap()))
 }
 
+fn row_to_option_record(row: SqliteRow) -> Option<RecordIndex> {
+    row.get::<Option<i64>, _>(0)
+        .map(|v| RecordIndex(usize::try_from(v).unwrap()))
+}
+
 impl SegmentIndex {
     fn to_row(&self) -> i64 {
         i64::try_from(self.0).unwrap()
@@ -285,6 +290,39 @@ impl Manifest {
         self.get_ordered_segment(id, "ASC").await
     }
 
+    async fn get_ordered_record_id(
+        &self,
+        id: &PartitionId,
+        field: &str,
+        order: &str,
+    ) -> Option<RecordIndex> {
+        sqlx::query(&format!(
+            "
+            SELECT {} FROM segments
+            WHERE topic = ?1 AND partition = ?2
+            ORDER BY {} {} LIMIT 1
+        ",
+            field, field, order
+        ))
+        .bind(&id.topic)
+        .bind(&id.partition)
+        .map(row_to_option_record)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap()
+        .flatten()
+    }
+
+    /// Find the lowest available record id for a given partition.
+    pub async fn get_min_record_id(&self, id: &PartitionId) -> Option<RecordIndex> {
+        self.get_ordered_record_id(id, "index_start", "ASC").await
+    }
+
+    /// Find the highest available record id for a given partition.
+    pub async fn get_max_record_id(&self, id: &PartitionId) -> Option<RecordIndex> {
+        self.get_ordered_record_id(id, "index_end", "DESC").await
+    }
+
     /// Remove the identified segment from the manifest.
     pub async fn remove_segment(&self, id: SegmentId<&PartitionId>) {
         sqlx::query(
@@ -451,7 +489,7 @@ mod test {
                 b.segment_id(SegmentIndex(0)),
                 &SegmentData {
                     time,
-                    index: RecordIndex(0)..RecordIndex(20),
+                    index: RecordIndex(0)..RecordIndex(15),
                     size: 12,
                 },
             )
@@ -459,6 +497,10 @@ mod test {
 
         assert_eq!(state.get_size(&a).await, Some(35));
         assert_eq!(state.get_size(&b).await, Some(12));
+        assert_eq!(state.get_min_record_id(&a).await, Some(RecordIndex(0)));
+        assert_eq!(state.get_max_record_id(&a).await, Some(RecordIndex(20)));
+        assert_eq!(state.get_min_record_id(&b).await, Some(RecordIndex(0)));
+        assert_eq!(state.get_max_record_id(&b).await, Some(RecordIndex(15)));
         assert_eq!(
             state
                 .get_partitions(a.topic())
@@ -526,6 +568,7 @@ mod test {
             state.get_segment_for_ix(&id, RecordIndex(15)).await,
             Some(SegmentIndex(1))
         );
+        assert_eq!(state.get_min_record_id(&id).await, Some(RecordIndex(10)));
         assert_eq!(state.get_min_segment(&id).await, Some(SegmentIndex(1)));
         assert_eq!(state.get_max_segment(&id).await, Some(SegmentIndex(1)));
         assert_eq!(state.get_size(&id).await, Some(13));
