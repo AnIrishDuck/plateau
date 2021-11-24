@@ -198,9 +198,8 @@ impl Partition {
         let range_end = RecordIndex(start.0 + records.len());
         let partition_start = self
             .manifest
-            .get_partition_indices(self.id.topic())
+            .get_partition_range(&self.id)
             .await
-            .get(self.id.partition())
             .map(|r| r.start)
             .unwrap_or(RecordIndex(0));
         let end = std::cmp::max(range_end, partition_start);
@@ -213,6 +212,18 @@ impl Partition {
         OptionFuture::from(slog_index.map(|ix| state.messages.get_record(ix)))
             .await
             .flatten()
+    }
+
+    pub(crate) async fn get_active_range(&self) -> Range<RecordIndex> {
+        let read = self.state.read().await;
+        let active_start = read.open_index;
+        let active_end = RecordIndex(active_start.0 + read.messages.current_len().await);
+        let stored = self
+            .manifest
+            .get_partition_range(&self.id)
+            .await
+            .unwrap_or(active_start..active_end);
+        std::cmp::min(active_start, stored.start)..std::cmp::max(active_end, stored.end)
     }
 
     async fn over_retention_limit(&self) -> bool {

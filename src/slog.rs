@@ -154,7 +154,9 @@ impl Slog {
 
     pub(crate) async fn get_records_for_segment(&self, ix: SegmentIndex) -> Vec<Record> {
         let state = self.state.read().await;
-        assert!(ix <= state.active_ix);
+        if ix > state.active_ix {
+            return vec![];
+        }
         state.get_segment(ix).await.cloned().unwrap_or_else(|| {
             let segment = self.get_segment(ix);
             if Path::new(segment.path()).exists() {

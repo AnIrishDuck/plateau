@@ -55,7 +55,7 @@ struct Records {
     records: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Schema, Deserialize)]
 struct RecordQuery {
     start: usize,
     limit: Option<usize>,
@@ -72,7 +72,11 @@ async fn main() {
     pretty_env_logger::init();
     let log = warp::log("plateau::http");
 
-    let (spec, filter) = openapi::spec().build(move || topic_append(catalog));
+    let (spec, filter) = openapi::spec().build(move || {
+        topic_append(catalog.clone())
+            .or(topic_get_partitions(catalog.clone()))
+            .or(topic_get_records(catalog))
+    });
 
     serve(filter.or(openapi_docs(spec)).with(log))
         .run(([127, 0, 0, 1], 3030))
@@ -121,7 +125,7 @@ async fn topic_get_partitions(
     let topic = catalog.get_topic(&topic_name).await;
     Ok(Json::from(Partitions {
         partitions: topic
-            .get_indices()
+            .get_partitions()
             .await
             .into_iter()
             .map(|(partition, range)| (Arc::new(partition), Span::from_range(range)))
@@ -134,20 +138,20 @@ async fn topic_get_partitions(
 async fn topic_get_records(
     topic_name: String,
     partition_name: String,
-    #[query] query: String,
+    query: Query<RecordQuery>,
     #[data] catalog: Catalog,
 ) -> Result<Json<Records>, Rejection> {
-    if let Ok(q) = serde_json::from_str::<RecordQuery>(&query) {
-        let topic = catalog.get_topic(&topic_name).await;
-        let limit = std::cmp::min(q.limit.unwrap_or(1000), 10000);
-        let (range, rs) = topic
-            .get_records(&partition_name, RecordIndex(q.start), limit)
-            .await;
-        Ok(Json::from(Records {
-            span: Span::from_range(range),
-            records: vec![],
-        }))
-    } else {
-        Err(rweb::reject::custom(InvalidQuery {}))
-    }
+    let query = query.into_inner();
+    let topic = catalog.get_topic(&topic_name).await;
+    let limit = std::cmp::min(query.limit.unwrap_or(1000), 10000);
+    let (range, rs) = topic
+        .get_records(&partition_name, RecordIndex(query.start), limit)
+        .await;
+    Ok(Json::from(Records {
+        span: Span::from_range(range),
+        records: rs
+            .into_iter()
+            .map(|r| String::from_utf8(r.message.data().to_vec()).unwrap())
+            .collect(),
+    }))
 }

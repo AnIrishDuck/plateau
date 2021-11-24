@@ -291,28 +291,29 @@ impl Manifest {
         self.get_ordered_segment(id, "ASC").await
     }
 
-    pub async fn get_partition_indices(&self, topic: &str) -> HashMap<String, Range<RecordIndex>> {
+    pub async fn get_partition_range(&self, id: &PartitionId) -> Option<Range<RecordIndex>> {
         sqlx::query(
             "
-            SELECT partition, MIN(index_start), MAX(index_end) FROM segments
-            WHERE topic = ?1
+            SELECT MIN(index_start), MAX(index_end) FROM segments
+            WHERE topic = ?1 AND partition = ?2
             GROUP BY partition
         ",
         )
-        .bind(&topic)
+        .bind(&id.topic())
+        .bind(&id.partition())
         .map(|row| {
-            (
-                row.get::<String, _>(0),
-                // index_start and index_end are not null, so if a partition
-                // exists then they also must exist
-                row_get_option_record(&row, 1).unwrap()..row_get_option_record(&row, 2).unwrap(),
-            )
+            match (
+                row_get_option_record(&row, 0),
+                row_get_option_record(&row, 1),
+            ) {
+                (Some(start), Some(end)) => Some(start..end),
+                _ => None,
+            }
         })
-        .fetch_all(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .unwrap()
-        .into_iter()
-        .collect()
+        .flatten()
     }
 
     /// Remove the identified segment from the manifest.
@@ -347,6 +348,20 @@ impl Manifest {
         .await
         .unwrap()
         .flatten()
+    }
+
+    pub async fn get_partitions(&self, topic: &str) -> Vec<String> {
+        sqlx::query(
+            "
+            SELECT DISTINCT partition FROM segments
+            WHERE topic = ?1
+        ",
+        )
+        .bind(topic)
+        .map(|row: SqliteRow| row.get::<String, _>(0))
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
     }
 
     /// Find the "open index" of a given partition.
@@ -476,11 +491,16 @@ mod test {
         assert_eq!(state.get_size(&a).await, Some(35));
         assert_eq!(state.get_size(&b).await, Some(12));
         assert_eq!(
-            state.get_partition_indices("topic").await,
-            HashMap::<_, _>::from_iter([
-                ("a".to_string(), RecordIndex(0)..RecordIndex(20)),
-                ("b".to_string(), RecordIndex(0)..RecordIndex(15))
-            ])
+            state.get_partition_range(&a).await.unwrap(),
+            RecordIndex(0)..RecordIndex(20)
+        );
+        assert_eq!(
+            state.get_partition_range(&b).await.unwrap(),
+            RecordIndex(0)..RecordIndex(15)
+        );
+        assert_eq!(
+            state.get_partitions(a.topic()).await,
+            vec!["a".to_string(), "b".to_string()]
         );
     }
 
@@ -540,8 +560,8 @@ mod test {
             Some(SegmentIndex(1))
         );
         assert_eq!(
-            state.get_partition_indices(id.topic()).await,
-            HashMap::<_, _>::from_iter([(id.partition.clone(), RecordIndex(10)..RecordIndex(20)),])
+            state.get_partition_range(&id).await,
+            Some(RecordIndex(10)..RecordIndex(20))
         );
         assert_eq!(state.get_min_segment(&id).await, Some(SegmentIndex(1)));
         assert_eq!(state.get_max_segment(&id).await, Some(SegmentIndex(1)));
@@ -553,5 +573,6 @@ mod test {
         assert_eq!(state.get_min_segment(&id).await, None);
         assert_eq!(state.get_max_segment(&id).await, None);
         assert_eq!(state.get_size(&id).await, None);
+        assert_eq!(state.get_partition_range(&id).await, None);
     }
 }
