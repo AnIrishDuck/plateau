@@ -204,12 +204,16 @@ impl State {
     pub(crate) async fn roll(&mut self, start: RecordIndex) -> bool {
         if let Some(time_range) = &self.time_range {
             // TODO make timeout configurable
-            let ready = timeout(Duration::from_millis(100), self.writer.send(WriteRequest {
-                segment: self.active_ix,
-                start,
-                time: time_range.clone(),
-                records: self.active.clone(),
-            })).await;
+            let ready = timeout(
+                Duration::from_millis(100),
+                self.writer.send(WriteRequest {
+                    segment: self.active_ix,
+                    start,
+                    time: time_range.clone(),
+                    records: self.active.clone(),
+                }),
+            )
+            .await;
 
             if ready.is_ok() {
                 self.pending = Some(std::mem::replace(&mut self.active, vec![]));
