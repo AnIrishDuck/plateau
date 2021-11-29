@@ -22,8 +22,9 @@ use std::convert::TryFrom;
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::timeout;
 
 /// Each segment in the slog has a unique increasing index
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -202,12 +203,13 @@ impl State {
 
     pub(crate) async fn roll(&mut self, start: RecordIndex) -> bool {
         if let Some(time_range) = &self.time_range {
-            let ready = self.writer.try_send(WriteRequest {
+            // TODO make timeout configurable
+            let ready = timeout(Duration::from_millis(100), self.writer.send(WriteRequest {
                 segment: self.active_ix,
                 start,
                 time: time_range.clone(),
                 records: self.active.clone(),
-            });
+            })).await;
 
             if ready.is_ok() {
                 self.pending = Some(std::mem::replace(&mut self.active, vec![]));
