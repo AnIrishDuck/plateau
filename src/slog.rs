@@ -17,6 +17,7 @@
 //! stall rolls until the write completes.
 use crate::manifest::SegmentData;
 use crate::segment::{Record, Segment};
+use chrono::{DateTime, Utc};
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
 use futures::{future, stream, Stream};
@@ -76,13 +77,13 @@ pub struct State {
     active_size: usize,
     writer: mpsc::Sender<WriteRequest>,
     pending: Option<Vec<Record>>,
-    time_range: Option<RangeInclusive<SystemTime>>,
+    time_range: Option<RangeInclusive<DateTime<Utc>>>,
 }
 
 struct WriteRequest {
     segment: SegmentIndex,
     start: RecordIndex,
-    time: RangeInclusive<SystemTime>,
+    time: RangeInclusive<DateTime<Utc>>,
     records: Vec<Record>,
 }
 
@@ -140,15 +141,12 @@ impl Slog {
             .cloned()
     }
 
-    pub(crate) fn segment_stream(
-        &self,
-        start: SegmentIndex,
-    ) -> impl Stream<Item = Vec<Record>> + '_ {
-        stream::iter(start.0..)
-            .flat_map(move |segment| {
-                self.get_records_for_segment(SegmentIndex(segment))
-                    .into_stream()
-            })
+    pub(crate) fn segment_stream<'a>(
+        &'a self,
+        indices: impl Stream<Item = SegmentIndex> + 'a,
+    ) -> impl Stream<Item = Vec<Record>> + 'a {
+        indices
+            .flat_map(move |index| self.get_records_for_segment(index).into_stream())
             .take_while(|rs| future::ready(rs.len() > 0))
     }
 
@@ -187,7 +185,7 @@ impl Slog {
         self.state.read().await.active_size
     }
 
-    pub(crate) async fn current_time_range(&self) -> Option<RangeInclusive<SystemTime>> {
+    pub(crate) async fn current_time_range(&self) -> Option<RangeInclusive<DateTime<Utc>>> {
         self.state.read().await.time_range.clone()
     }
 
@@ -293,9 +291,9 @@ fn spawn_slog_thread(root: PathBuf, name: String) -> (mpsc::Sender<WriteRequest>
 
 mod test {
     use super::*;
+    use chrono::{TimeZone, Utc};
     use parquet::data_type::ByteArray;
     use std::path::PathBuf;
-    use std::time::SystemTime;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -309,7 +307,7 @@ mod test {
         let records: Vec<_> = vec!["abc", "def", "ghi"]
             .into_iter()
             .map(|message| Record {
-                time: SystemTime::UNIX_EPOCH,
+                time: Utc.timestamp(0, 0),
                 message: ByteArray::from(message),
             })
             .collect();

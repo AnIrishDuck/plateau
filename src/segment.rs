@@ -1,8 +1,9 @@
 //! A segment contains a bundle of time and logically indexed records.
 //!
 //! Currently, the only supported segment format is local Parquet files.
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use std::convert::{TryFrom, TryInto};
-use std::{fs, path::PathBuf, sync::Arc, time::Duration, time::SystemTime};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use parquet::{
     column::reader::ColumnReader,
@@ -18,7 +19,7 @@ use parquet::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
-    pub time: SystemTime,
+    pub time: DateTime<Utc>,
     pub message: ByteArray,
 }
 
@@ -83,8 +84,8 @@ impl SegmentWriter {
         let mut times = vec![];
         let mut messages = vec![];
         for r in record.drain(..) {
-            let dt = r.time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-            times.push(dt.as_millis().try_into().unwrap());
+            let dt = r.time.signed_duration_since(Utc.timestamp(0, 0));
+            times.push(dt.num_milliseconds());
             messages.push(r.message);
         }
 
@@ -172,7 +173,7 @@ impl SegmentReader {
             };
 
             results.extend(tvs.into_iter().zip(arrs.into_iter()).map(|(tv, message)| {
-                let time = SystemTime::UNIX_EPOCH + Duration::from_millis(tv.try_into().unwrap());
+                let time = Utc.timestamp(0, 0) + Duration::milliseconds(tv);
                 Record { time, message }
             }));
         }
@@ -193,7 +194,7 @@ mod test {
         let records: Vec<_> = vec!["abc", "def", "ghi"]
             .into_iter()
             .map(|message| Record {
-                time: SystemTime::UNIX_EPOCH,
+                time: Utc.timestamp(0, 0),
                 message: ByteArray::from(message),
             })
             .collect();

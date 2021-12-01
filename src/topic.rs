@@ -7,12 +7,13 @@ pub use crate::partition::{Retention, Rolling};
 pub use crate::segment::Record;
 pub use crate::slog::Index;
 use crate::slog::RecordIndex;
+use chrono::{DateTime, Utc};
 use futures::future::FutureExt;
 use futures::stream;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::fs;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, RwLockReadGuard};
 
@@ -52,17 +53,29 @@ impl Topic {
         root.join(name)
     }
 
-    pub async fn get_partitions(&self) -> HashMap<String, Range<RecordIndex>> {
+    pub async fn readable_ids(&self) -> HashMap<String, Range<RecordIndex>> {
+        self.map_partitions(|partition| async move { Some(partition.readable_ids().await) })
+            .await
+    }
+
+    pub async fn map_partitions<'a, Fut, F, T>(&'a self, mut f: F) -> HashMap<String, T>
+    where
+        F: FnMut(RwLockReadGuard<'a, Partition>) -> Fut,
+        Fut: futures::Future<Output = Option<T>>,
+    {
         let active: Vec<String> = { self.partitions.read().await.keys().cloned().collect() };
         let stored = self.manifest.get_partitions(&self.name).await;
+
         stream::iter(active.iter().chain(stored.iter()))
-            .flat_map(|name| {
+            .flat_map(move |name| {
                 self.get_partition(name)
-                    .then(move |l| async move {
-                        let r = l.get_active_range().await;
-                        (name.clone(), r)
-                    })
+                    .map(move |p| (name.clone(), p))
                     .into_stream()
+            })
+            .flat_map(|(name, p)| {
+                f(p).into_stream()
+                    .flat_map(|v| stream::iter(v.into_iter()))
+                    .map(move |v| (name.clone(), v))
             })
             .collect()
             .await
@@ -114,9 +127,20 @@ impl Topic {
         partition_name: &str,
         start: RecordIndex,
         limit: usize,
-    ) -> (Range<RecordIndex>, Vec<Record>) {
+    ) -> (Option<Range<RecordIndex>>, Vec<Record>) {
         let partition = self.get_partition(partition_name).await;
         partition.get_records(start, limit).await
+    }
+
+    pub(crate) async fn get_records_by_time(
+        &self,
+        partition_name: &str,
+        start: RecordIndex,
+        times: RangeInclusive<DateTime<Utc>>,
+        limit: usize,
+    ) -> (Option<Range<RecordIndex>>, Vec<Record>) {
+        let partition = self.get_partition(partition_name).await;
+        partition.get_records_by_time(start, times, limit).await
     }
 
     pub async fn commit(&self) {
@@ -128,6 +152,7 @@ impl Topic {
 
 mod test {
     use super::*;
+    use chrono::{TimeZone, Utc};
     use parquet::data_type::ByteArray;
     use std::collections::HashSet;
     use std::convert::TryFrom;
@@ -154,7 +179,7 @@ mod test {
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
             .map(|message| Record {
-                time: SystemTime::UNIX_EPOCH,
+                time: Utc.timestamp(0, 0),
                 message: ByteArray::from(message),
             })
             .collect();
@@ -182,7 +207,7 @@ mod test {
         )
         .await;
         assert_eq!(
-            topic.get_partitions().await,
+            topic.readable_ids().await,
             HashMap::<_, _>::from_iter([
                 ("partition-0".to_string(), RecordIndex(0)..RecordIndex(2)),
                 ("partition-1".to_string(), RecordIndex(0)..RecordIndex(2)),
@@ -207,7 +232,7 @@ mod test {
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
             .map(|message| Record {
-                time: SystemTime::UNIX_EPOCH,
+                time: Utc.timestamp(0, 0),
                 message: ByteArray::from(message),
             })
             .collect();
@@ -227,13 +252,13 @@ mod test {
         assert_eq!(
             topic.get_records("partition-0", RecordIndex(0), 1000).await,
             (
-                RecordIndex(0)..RecordIndex(2),
+                Some(RecordIndex(0)..RecordIndex(2)),
                 vec![records[0].clone(), records[3].clone()]
             )
         );
 
         assert_eq!(
-            topic.get_partitions().await,
+            topic.readable_ids().await,
             HashMap::<_, _>::from_iter([
                 ("partition-0".to_string(), RecordIndex(0)..RecordIndex(2)),
                 ("partition-1".to_string(), RecordIndex(0)..RecordIndex(2)),
@@ -279,7 +304,7 @@ mod test {
                     .clone()
                     .into_iter()
                     .map(|message| Record {
-                        time: SystemTime::UNIX_EPOCH,
+                        time: Utc.timestamp(0, 0),
                         message: ByteArray::from(
                             format!("{{ \"data\": \"{}-{}\" }}", data, message).as_str(),
                         ),
@@ -290,7 +315,7 @@ mod test {
                 let mut prev = None;
                 use itermore::IterMore;
                 for rs in records.iter().cycle().take(total).chunks::<10000>() {
-                    let now = SystemTime::now();
+                    let now = Utc.timestamp(0, 0);
                     let rs: Vec<Record> = rs
                         .iter()
                         .cloned()

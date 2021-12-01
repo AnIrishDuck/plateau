@@ -10,10 +10,12 @@
 //! theoretically allow us to support somewhat arbitrary SQL databases, but
 //! minor query modifications will be necessary.
 use chrono::{DateTime, Utc};
+use futures::stream;
+use futures::stream::StreamExt;
 use sqlx::query::Query;
 use sqlx::sqlite::{Sqlite, SqliteArguments};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::{Executor, Row};
+use sqlx::{ColumnIndex, Executor, Row};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::ops::{Deref, Range, RangeInclusive};
@@ -97,9 +99,23 @@ pub struct Manifest {
 
 #[derive(Clone, Debug)]
 pub struct SegmentData {
-    pub time: RangeInclusive<SystemTime>,
+    pub time: RangeInclusive<DateTime<Utc>>,
     pub index: Range<RecordIndex>,
     pub size: usize,
+}
+
+fn row_to_segment_data(row: SqliteRow) -> SegmentData {
+    let t_start: DateTime<Utc> = row.get("time_start");
+    let t_end: DateTime<Utc> = row.get("time_end");
+    SegmentData {
+        time: t_start..=t_end,
+        index: RecordIndex::from_row(&row, "index_start")..RecordIndex::from_row(&row, "index_end"),
+        size: usize::try_from(row.get::<i64, _>("size")).unwrap(),
+    }
+}
+
+fn row_get_segment(row: &SqliteRow, index: usize) -> SegmentIndex {
+    SegmentIndex(usize::try_from(row.get::<i64, _>(0)).unwrap())
 }
 
 fn row_to_option_segment(row: SqliteRow) -> Option<SegmentIndex> {
@@ -117,7 +133,10 @@ impl SegmentIndex {
         i64::try_from(self.0).unwrap()
     }
 
-    fn from_row(row: SqliteRow, index: usize) -> Self {
+    fn from_row<I>(row: &SqliteRow, index: I) -> Self
+    where
+        I: ColumnIndex<SqliteRow>,
+    {
         SegmentIndex(usize::try_from(row.get::<i64, _>(index)).unwrap())
     }
 }
@@ -127,7 +146,10 @@ impl RecordIndex {
         i64::try_from(self.0).unwrap()
     }
 
-    fn from_row(row: &SqliteRow, index: usize) -> Self {
+    fn from_row<I>(row: &SqliteRow, index: I) -> Self
+    where
+        I: ColumnIndex<SqliteRow>,
+    {
         RecordIndex(usize::try_from(row.get::<i64, _>(index)).unwrap())
     }
 }
@@ -168,6 +190,10 @@ impl Manifest {
             pool.execute("CREATE INDEX segments_start ON segments(topic, partition, index_start)")
                 .await
                 .unwrap();
+
+            pool.execute("CREATE INDEX segments_time_range ON segments(topic, partition, time_start, time_end)")
+                .await
+                .unwrap();
         }
         // TODO clear pending segments (size=NULL)
         Manifest { path, pool }
@@ -197,8 +223,8 @@ impl Manifest {
         .bind(id.topic())
         .bind(id.partition())
         .bind(id.segment.to_row())
-        .bind(DateTime::<Utc>::from(*data.time.start()))
-        .bind(DateTime::<Utc>::from(*data.time.end()))
+        .bind(data.time.start())
+        .bind(data.time.end())
         .bind(data.index.start.to_row())
         .bind(data.index.end.to_row())
         .bind(i64::try_from(data.size).unwrap())
@@ -218,19 +244,10 @@ impl Manifest {
         .bind(id.topic())
         .bind(id.partition())
         .bind(id.segment.to_row())
-        .map(|row: SqliteRow| {
-            let t_start: DateTime<Utc> = row.get(0);
-            let t_end: DateTime<Utc> = row.get(1);
-            Some(SegmentData {
-                time: (SystemTime::from(t_start)..=SystemTime::from(t_end)),
-                index: RecordIndex::from_row(&row, 2)..RecordIndex::from_row(&row, 3),
-                size: usize::try_from(row.get::<i64, _>(4)).unwrap(),
-            })
-        })
+        .map(row_to_segment_data)
         .fetch_optional(&self.pool)
         .await
         .unwrap()
-        .flatten()
     }
 
     async fn get_segment<'a>(
@@ -289,6 +306,67 @@ impl Manifest {
     /// Find the segment with the lowest index for a given partition.
     pub async fn get_min_segment(&self, id: &PartitionId) -> Option<SegmentIndex> {
         self.get_ordered_segment(id, "ASC").await
+    }
+
+    pub fn stream_segments<'a>(
+        &'a self,
+        id: &'a PartitionId,
+        start: SegmentIndex,
+    ) -> impl futures::Stream<Item = (SegmentIndex, SegmentData)> + 'a {
+        sqlx::query(
+            "
+                SELECT segment_id, time_start, time_end, index_start, index_end, size FROM segments
+                WHERE topic = ?1 AND partition = ?2 AND segment_id >= ?3
+                ORDER BY segment_id ASC
+            ",
+        )
+        .bind(&id.topic)
+        .bind(&id.partition)
+        .bind(start.to_row())
+        .map(|row| {
+            (
+                SegmentIndex::from_row(&row, "segment_id"),
+                row_to_segment_data(row),
+            )
+        })
+        .fetch_many(&self.pool)
+        .flat_map(|r| stream::iter(r.unwrap().right()))
+    }
+
+    pub fn stream_time_segments<'a>(
+        &'a self,
+        id: &'a PartitionId,
+        start: SegmentIndex,
+        times: &'a RangeInclusive<DateTime<Utc>>,
+    ) -> impl futures::Stream<Item = (SegmentIndex, SegmentData)> + 'a {
+        // see discussion on finding the intersection of intervals here:
+        // https://scicomp.stackexchange.com/questions/26258/the-easiest-way-to-find-intersection-of-two-intervals
+        // our problem is a subset of that: we only want to return segments
+        // where an intersection exists; we don't care what the intersection is
+        sqlx::query(
+            "
+                SELECT segment_id, time_start, time_end, index_start, index_end, size FROM segments
+                WHERE (
+                    topic = ?1 AND partition = ?2
+                    AND ?3 <= time_end AND time_start <= ?4
+                    AND segment_id >= ?5
+                )
+                ORDER BY segment_id ASC
+            ",
+        )
+        .bind(&id.topic)
+        .bind(&id.partition)
+        .bind(times.start())
+        .bind(times.end())
+        .bind(start.to_row())
+        .map(|row| {
+            (
+                SegmentIndex::from_row(&row, "segment_id"),
+                row_to_segment_data(row),
+            )
+        })
+        .fetch_many(&self.pool)
+        .flat_map(|r| stream::iter(r.unwrap().right()))
     }
 
     pub async fn get_partition_range(&self, id: &PartitionId) -> Option<Range<RecordIndex>> {
@@ -381,6 +459,7 @@ impl Manifest {
 
 mod test {
     use super::*;
+    use chrono::TimeZone;
     use std::collections::HashSet;
     use std::iter::FromIterator;
     use std::time::SystemTime;
@@ -394,7 +473,7 @@ mod test {
         let state = Manifest::attach(PathBuf::from(path)).await;
         assert_eq!(state.get_max_segment(&id).await, None);
 
-        let time = SystemTime::UNIX_EPOCH..=SystemTime::UNIX_EPOCH;
+        let time = Utc.timestamp(0, 0)..=Utc.timestamp(0, 0);
         for ix in 0..10 {
             let time = time.clone();
             state
@@ -451,7 +530,7 @@ mod test {
         let a = PartitionId::new(&topic, "a");
         let b = PartitionId::new(&topic, "b");
 
-        let time = SystemTime::UNIX_EPOCH..=SystemTime::UNIX_EPOCH;
+        let time = Utc.timestamp(0, 0)..=Utc.timestamp(0, 0);
         for ix in 0..10 {
             let time = time.clone();
             state
@@ -514,7 +593,7 @@ mod test {
         let state = Manifest::attach(PathBuf::from(path)).await;
         assert_eq!(state.get_max_segment(&id).await, None);
 
-        let time = SystemTime::UNIX_EPOCH..=SystemTime::UNIX_EPOCH;
+        let time = Utc.timestamp(0, 0)..=Utc.timestamp(0, 0);
         for ix in 0..10 {
             let time = time.clone();
             state
@@ -574,5 +653,108 @@ mod test {
         assert_eq!(state.get_max_segment(&id).await, None);
         assert_eq!(state.get_size(&id).await, None);
         assert_eq!(state.get_partition_range(&id).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_time_query() {
+        let topic = "topic";
+        let partition = "removal";
+        let id = PartitionId::new(topic, partition);
+        let root = tempdir().unwrap();
+        let path = root.path().join("testing.sqlite");
+        let state = Manifest::attach(PathBuf::from(path)).await;
+        assert_eq!(state.get_max_segment(&id).await, None);
+
+        async fn add_record(
+            state: &Manifest,
+            segment: SegmentId<&PartitionId>,
+            records: Range<usize>,
+            times: RangeInclusive<i64>,
+        ) {
+            let time = Utc.timestamp(*times.start(), 0)..=Utc.timestamp(*times.end(), 0);
+            let index = RecordIndex(records.start)..RecordIndex(records.end);
+            state
+                .update(
+                    segment,
+                    &SegmentData {
+                        time,
+                        index,
+                        size: 12,
+                    },
+                )
+                .await
+        }
+
+        async fn verify_stream(
+            state: &Manifest,
+            id: &PartitionId,
+            start: usize,
+            times: RangeInclusive<i64>,
+            segments: Vec<usize>,
+        ) {
+            let times = Utc.timestamp(*times.start(), 0)..=Utc.timestamp(*times.end(), 0);
+            assert_eq!(
+                state
+                    .stream_time_segments(id, SegmentIndex(start), &times)
+                    .map(|data| data.0)
+                    .collect::<Vec<_>>()
+                    .await,
+                segments
+                    .into_iter()
+                    .map(|ix| SegmentIndex(ix))
+                    .collect::<Vec<_>>(),
+                "query {:?}",
+                times
+            );
+        }
+
+        add_record(&state, id.segment_id(SegmentIndex(0)), 0..10, 500..=600).await;
+        // overlap
+        add_record(&state, id.segment_id(SegmentIndex(1)), 10..20, 580..=800).await;
+        // gap
+        add_record(&state, id.segment_id(SegmentIndex(2)), 20..30, 820..=900).await;
+        // out-of order
+        add_record(&state, id.segment_id(SegmentIndex(3)), 30..40, 590..=800).await;
+
+        // single points-in-time
+        verify_stream(&state, &id, 0, 400..=400, vec![]).await;
+        verify_stream(&state, &id, 0, 500..=500, vec![0]).await;
+        verify_stream(&state, &id, 0, 520..=520, vec![0]).await;
+        verify_stream(&state, &id, 0, 585..=585, vec![0, 1]).await;
+        verify_stream(&state, &id, 0, 595..=595, vec![0, 1, 3]).await;
+        verify_stream(&state, &id, 0, 700..=700, vec![1, 3]).await;
+        verify_stream(&state, &id, 0, 850..=850, vec![2]).await;
+        verify_stream(&state, &id, 0, 910..=910, vec![]).await;
+
+        // ranges: query before all
+        verify_stream(&state, &id, 0, 400..=499, vec![]).await;
+
+        // ranges: query after all
+        verify_stream(&state, &id, 0, 910..=1000, vec![]).await;
+
+        // ranges: start before record range, end within record range
+        verify_stream(&state, &id, 0, 400..=500, vec![0]).await;
+        verify_stream(&state, &id, 0, 400..=520, vec![0]).await;
+        verify_stream(&state, &id, 0, 400..=585, vec![0, 1]).await;
+        verify_stream(&state, &id, 0, 400..=700, vec![0, 1, 3]).await;
+
+        // ranges: start and end within record range
+        verify_stream(&state, &id, 0, 501..=520, vec![0]).await;
+        verify_stream(&state, &id, 0, 501..=585, vec![0, 1]).await;
+        verify_stream(&state, &id, 0, 501..=700, vec![0, 1, 3]).await;
+        verify_stream(&state, &id, 2, 501..=700, vec![3]).await;
+        verify_stream(&state, &id, 0, 820..=850, vec![2]).await;
+        verify_stream(&state, &id, 0, 601..=700, vec![1, 3]).await;
+
+        // ranges: start within record range, end after
+        verify_stream(&state, &id, 0, 500..=1000, vec![0, 1, 2, 3]).await;
+        verify_stream(&state, &id, 1, 500..=1000, vec![1, 2, 3]).await;
+        verify_stream(&state, &id, 0, 520..=1000, vec![0, 1, 2, 3]).await;
+        verify_stream(&state, &id, 2, 520..=1000, vec![2, 3]).await;
+        verify_stream(&state, &id, 0, 705..=1000, vec![1, 2, 3]).await;
+        verify_stream(&state, &id, 0, 850..=1000, vec![2]).await;
+
+        // finally, verify when all segments are contained within the range
+        verify_stream(&state, &id, 0, 250..=1000, vec![0, 1, 2, 3]).await;
     }
 }

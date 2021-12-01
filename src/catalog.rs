@@ -53,9 +53,9 @@ mod test {
     use super::*;
     use crate::partition::RecordIndex;
     use crate::segment::Record;
+    use chrono::{TimeZone, Utc};
     use parquet::data_type::ByteArray;
     use std::thread;
-    use std::time::SystemTime;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -67,7 +67,7 @@ mod test {
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
             .map(|message| Record {
-                time: SystemTime::UNIX_EPOCH,
+                time: Utc.timestamp(0, 0),
                 message: ByteArray::from(message),
             })
             .collect();

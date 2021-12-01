@@ -6,6 +6,7 @@ mod slog;
 mod topic;
 
 use ::log::info;
+use chrono::{DateTime, Utc};
 use parquet::data_type::ByteArray;
 use rweb::*;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,11 @@ use crate::topic::Record;
 #[derive(Deserialize)]
 struct Insert {
     records: Vec<String>,
+}
+
+#[derive(Schema, Deserialize)]
+struct InsertQuery {
+    time: Option<String>,
 }
 
 #[derive(Schema, Serialize)]
@@ -51,7 +57,7 @@ struct Partitions {
 
 #[derive(Schema, Serialize)]
 struct Records {
-    span: Span,
+    span: Option<Span>,
     records: Vec<String>,
 }
 
@@ -59,6 +65,10 @@ struct Records {
 struct RecordQuery {
     start: usize,
     limit: Option<usize>,
+    #[serde(rename = "time.start")]
+    start_time: Option<String>,
+    #[serde(rename = "time.end")]
+    end_time: Option<String>,
 }
 
 #[derive(Debug)]
@@ -89,10 +99,20 @@ async fn main() {
 async fn topic_append(
     topic_name: String,
     partition_name: String,
+    query: Query<InsertQuery>,
     #[data] catalog: Catalog,
     #[json] request: Insert,
 ) -> Result<Json<Inserted>, Rejection> {
-    let time = SystemTime::now();
+    let query = query.into_inner();
+    let time = if let Some(s) = query.time {
+        if let Ok(time) = DateTime::parse_from_rfc3339(&s) {
+            time.with_timezone(&Utc)
+        } else {
+            return Err(warp::reject::custom(InvalidQuery {}));
+        }
+    } else {
+        Utc::now()
+    };
     let rs: Vec<_> = request
         .records
         .into_iter()
@@ -123,10 +143,10 @@ async fn topic_get_partitions(
     #[data] catalog: Catalog,
 ) -> Result<Json<Partitions>, Rejection> {
     let topic = catalog.get_topic(&topic_name).await;
+    let indices = topic.readable_ids().await;
+
     Ok(Json::from(Partitions {
-        partitions: topic
-            .get_partitions()
-            .await
+        partitions: indices
             .into_iter()
             .map(|(partition, range)| (Arc::new(partition), Span::from_range(range)))
             .collect(),
@@ -143,12 +163,31 @@ async fn topic_get_records(
 ) -> Result<Json<Records>, Rejection> {
     let query = query.into_inner();
     let topic = catalog.get_topic(&topic_name).await;
+    let start_record = RecordIndex(query.start);
     let limit = std::cmp::min(query.limit.unwrap_or(1000), 10000);
-    let (range, rs) = topic
-        .get_records(&partition_name, RecordIndex(query.start), limit)
-        .await;
+    let (range, rs) = if let Some(start) = query.start_time {
+        if let Some(end) = query.end_time {
+            let start = DateTime::parse_from_rfc3339(&start);
+            let end = DateTime::parse_from_rfc3339(&end);
+            if let (Ok(start), Ok(end)) = (start, end) {
+                let times = start.with_timezone(&Utc)..=end.with_timezone(&Utc);
+                topic
+                    .get_records_by_time(&partition_name, start_record, times, limit)
+                    .await
+            } else {
+                return Err(warp::reject::custom(InvalidQuery {}));
+            }
+        } else {
+            return Err(warp::reject::custom(InvalidQuery {}));
+        }
+    } else {
+        topic
+            .get_records(&partition_name, start_record, limit)
+            .await
+    };
+
     Ok(Json::from(Records {
-        span: Span::from_range(range),
+        span: range.map(Span::from_range),
         records: rs
             .into_iter()
             .map(|r| String::from_utf8(r.message.data().to_vec()).unwrap())
