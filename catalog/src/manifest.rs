@@ -557,6 +557,22 @@ impl Manifest {
         .await
         .unwrap()
     }
+
+    /// Topics ordered from newest (most recent `time_end`) to oldest. Used by
+    /// stochastic reconcile to bias sampling toward recently-active topics.
+    pub async fn get_topics_by_recency(&self) -> Vec<String> {
+        sqlx::query(
+            "
+            SELECT topic FROM segments
+            GROUP BY topic
+            ORDER BY MAX(time_end) DESC
+        ",
+        )
+        .map(|row: SqliteRow| row.get::<String, _>(0))
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
 }
 
 #[cfg(test)]

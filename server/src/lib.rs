@@ -73,14 +73,20 @@ pub async fn task_from_catalog_config(
 ) -> bool {
     let (addr, end_tx, server) = http::serve(config.clone(), catalog.clone()).await;
 
-    // Start reconciliation task if configured
+    // Start a one-shot full reconciliation task on startup if configured. The
+    // startup pass always runs an exhaustive `All` sweep regardless of the
+    // `sampling` field, since the periodic stochastic pass below is the right
+    // place to honor a `Stochastic` strategy.
     if let Some(reconcile_config) = &config.reconcile {
         tracing::info!(
             "starting reconciliation task with config: {:?}",
             reconcile_config
         );
-        let mut reconciler =
-            catalog::ReconcileJob::with_config(catalog.clone(), reconcile_config.clone());
+        let startup_config = catalog::ReconcileConfig {
+            sampling: catalog::reconcile::SamplingStrategy::All,
+            ..reconcile_config.clone()
+        };
+        let mut reconciler = catalog::ReconcileJob::with_config(catalog.clone(), startup_config);
 
         tokio::spawn(async move {
             // Run reconciliation once and exit
@@ -97,7 +103,9 @@ pub async fn task_from_catalog_config(
 
     {
         use futures::future::FutureExt;
-        let mut tasks = vec![Catalog::checkpoints(catalog.clone()).boxed(), stop, server];
+        let checkpoint_task =
+            Catalog::checkpoints_with_reconcile(catalog.clone(), config.reconcile.clone()).boxed();
+        let mut tasks = vec![checkpoint_task, stop, server];
 
         if config.catalog.storage.monitor {
             tasks.push(catalog.monitor_disk_storage().boxed());

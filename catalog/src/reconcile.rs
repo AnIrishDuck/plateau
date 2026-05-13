@@ -18,6 +18,9 @@ use anyhow::Result;
 use bytesize::ByteSize;
 use futures::stream::StreamExt;
 use plateau_data::segment::Segment;
+use rand::rngs::StdRng;
+use rand::seq::{index, IndexedRandom};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -43,6 +46,9 @@ pub struct ReconcileConfig {
     /// Set of fixes to apply during reconciliation
     #[serde(default)]
     pub fixes: BTreeSet<ReconcileFix>,
+    /// How to choose which topics/partitions to reconcile in a pass.
+    #[serde(default)]
+    pub sampling: SamplingStrategy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,6 +58,39 @@ pub enum ReconcileFix {
     UpdateManifestSizes,
     // TODO: RemoveOrphans,
     // TODO: RemoveUntrackedSegments
+}
+
+/// How a reconciliation pass selects work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SamplingStrategy {
+    /// Reconcile every topic and partition in the catalog. This is the
+    /// exhaustive default and the only mode that can detect orphan files
+    /// (since orphan detection requires visiting every partition in a topic).
+    All,
+    /// Pick a random subset of topics and partitions to reconcile.
+    ///
+    /// Topics are sampled without replacement using harmonic weights over
+    /// topics ordered newest-first by their most recent segment `time_end`:
+    /// `weight(rank) = 1 / (rank + 1)`. This biases sampling strongly toward
+    /// recently active topics while still giving older topics a chance to be
+    /// audited. Within each chosen topic, `partitions` partitions are sampled
+    /// uniformly at random without replacement.
+    ///
+    /// Orphan-file detection is skipped in this mode because we don't visit
+    /// every partition.
+    Stochastic {
+        /// Number of topics to sample.
+        topics: usize,
+        /// Number of partitions to sample per chosen topic.
+        partitions: usize,
+    },
+}
+
+impl Default for SamplingStrategy {
+    fn default() -> Self {
+        Self::All
+    }
 }
 
 /// A reconciliation job that incrementally validates consistency between
@@ -73,9 +112,12 @@ struct ReconcileState {
     current_topic_index: usize,
     /// Current partition being processed within the current topic
     current_partition_index: usize,
-    /// All topics in the catalog
-    topics: Option<Vec<String>>,
-    /// Accumulator for all segments in the current topic
+    /// Planned work for this pass: `(topic, partitions to check)`.
+    /// `None` until the work has been planned for the current pass.
+    work: Option<Vec<(String, Vec<String>)>>,
+    /// Accumulator for segment files in the current topic. Only meaningful
+    /// when reconciling every partition of the topic (i.e. orphan detection
+    /// is enabled).
     topic_segments: BTreeSet<PathBuf>,
     /// Statistics from the reconciliation
     stats: ReconcileStats,
@@ -254,70 +296,119 @@ impl ReconcileJob {
 
     /// Process the next unit of work in the reconciliation
     async fn process_next_unit(&mut self) -> Result<bool> {
-        // Load topics if we haven't already
-        let topics = {
-            if let Some(topics) = &self.state.topics {
-                topics
-            } else {
-                self.state.topics = Some(self.catalog.manifest().get_topics().await);
-                self.state.topics.as_ref().unwrap()
-            }
-        };
+        // Plan the work for this pass if we haven't already.
+        if self.state.work.is_none() {
+            self.state.work = Some(self.plan_work().await);
+        }
+        let work = self.state.work.as_ref().unwrap();
 
-        // Get current positions
-        let (current_topic_index, current_partition_index, topics_len) = {
-            (
-                self.state.current_topic_index,
-                self.state.current_partition_index,
-                topics.len(),
-            )
-        };
+        let current_topic_index = self.state.current_topic_index;
+        let current_partition_index = self.state.current_partition_index;
 
         // If we've processed all topics, we're done
-        if current_topic_index >= topics_len {
+        if current_topic_index >= work.len() {
             return Ok(true);
         }
 
-        // Get the current topic name
-        let topic_name = topics[current_topic_index].clone();
+        let (topic_name, partitions) = &work[current_topic_index];
+        let topic_name = topic_name.clone();
+        let partitions_len = partitions.len();
 
         debug!("Reconciling topic: {}", topic_name);
 
-        // Get all partitions for this topic
-        let partitions = self.catalog.manifest().get_partitions(&topic_name).await;
-
-        // If we've processed all partitions in this topic, move to the next topic
-        if current_partition_index >= partitions.len() {
-            let topics_len = topics.len();
+        // If we've processed all partitions in this topic, move to the next topic.
+        // Orphan detection only runs when we plan to visit every partition.
+        if current_partition_index >= partitions_len {
+            let work_len = work.len();
             let topic_segments = mem::take(&mut self.state.topic_segments);
-            self.identify_untracked_files(&topic_name, topic_segments)
-                .await?;
+            if self.scans_all_partitions() {
+                self.identify_untracked_files(&topic_name, topic_segments)
+                    .await?;
+            }
             self.state.current_partition_index = 0;
             self.state.current_topic_index += 1;
 
-            // If we've processed all topics, we're done
-            if self.state.current_topic_index >= topics_len {
+            if self.state.current_topic_index >= work_len {
                 return Ok(true);
             }
 
-            // Not done yet, but we've completed this unit of work
             return Ok(false);
         }
 
-        // Process the current partition
         let partition_name = partitions[current_partition_index].clone();
         debug!("Reconciling partition: {}/{}", topic_name, partition_name);
 
-        // Process this partition
         let partition_segments = self
             .process_partition_phase(&topic_name, &partition_name)
             .await?;
 
-        self.state.topic_segments.extend(partition_segments);
+        if self.scans_all_partitions() {
+            self.state.topic_segments.extend(partition_segments);
+        }
         self.state.current_partition_index += 1;
 
-        // We've processed one unit of work
         Ok(false)
+    }
+
+    fn scans_all_partitions(&self) -> bool {
+        matches!(self.config.sampling, SamplingStrategy::All)
+    }
+
+    /// Build the work list for this pass according to the sampling strategy.
+    async fn plan_work(&self) -> Vec<(String, Vec<String>)> {
+        match &self.config.sampling {
+            SamplingStrategy::All => {
+                let topics = self.catalog.manifest().get_topics().await;
+                let mut work = Vec::with_capacity(topics.len());
+                for topic in topics {
+                    let partitions = self.catalog.manifest().get_partitions(&topic).await;
+                    work.push((topic, partitions));
+                }
+                work
+            }
+            SamplingStrategy::Stochastic { topics, partitions } => {
+                if *topics == 0 || *partitions == 0 {
+                    return Vec::new();
+                }
+
+                let ordered = self.catalog.manifest().get_topics_by_recency().await;
+                if ordered.is_empty() {
+                    return Vec::new();
+                }
+
+                // StdRng (not ThreadRng) so the future remains `Send` across
+                // `.await` points inside this loop.
+                let mut rng = StdRng::from_os_rng();
+                let want_topics = (*topics).min(ordered.len());
+
+                // Sample distinct topic ranks without replacement, weighted
+                // harmonically so newer topics dominate.
+                let topic_indices = match index::sample_weighted(
+                    &mut rng,
+                    ordered.len(),
+                    |rank| 1.0_f64 / (rank as f64 + 1.0),
+                    want_topics,
+                ) {
+                    Ok(ix) => ix,
+                    Err(e) => {
+                        warn!("stochastic topic sampling failed: {e:?}");
+                        return Vec::new();
+                    }
+                };
+
+                let mut work = Vec::with_capacity(want_topics);
+                for ix in topic_indices.iter() {
+                    let topic = ordered[ix].clone();
+                    let all_parts = self.catalog.manifest().get_partitions(&topic).await;
+                    let chosen: Vec<String> = all_parts
+                        .choose_multiple(&mut rng, *partitions)
+                        .cloned()
+                        .collect();
+                    work.push((topic, chosen));
+                }
+                work
+            }
+        }
     }
 
     async fn identify_untracked_files(
@@ -562,12 +653,23 @@ impl ReconcileJob {
     pub async fn reset(&mut self) {
         self.state.current_topic_index = 0;
         self.state.current_partition_index = 0;
-        self.state.topics = None;
+        self.state.work = None;
+        self.state.topic_segments.clear();
         self.state.stats = if self.config.track_files {
             ReconcileStats::with_path_tracking()
         } else {
             ReconcileStats::default()
         };
+    }
+
+    /// Execute a single complete pass: reset state, plan work according to the
+    /// configured [SamplingStrategy], and run to completion. Intended to be
+    /// called periodically (e.g. from the catalog retention loop) for
+    /// stochastic reconciliation.
+    pub async fn pass(&mut self) -> Result<()> {
+        self.reset().await;
+        self.run(None).await?;
+        Ok(())
     }
 }
 
@@ -930,5 +1032,179 @@ mod tests {
                    verify_stats.files_checked.len(), verify_stats.size_mismatches.len(), verify_stats.missing_files.len());
 
         Ok(())
+    }
+
+    /// Helper: populate `catalog` with `topics * partitions_per_topic` partitions
+    /// of dummy data, one record per partition. Topics are written in order so
+    /// `topic-0` is oldest and `topic-{topics-1}` is newest.
+    async fn seed_topics(catalog: &Catalog, topics: usize, partitions_per_topic: usize) {
+        for t in 0..topics {
+            let topic_name = format!("topic-{t}");
+            let topic = catalog.get_topic(&topic_name).await;
+            for p in 0..partitions_per_topic {
+                let part_name = format!("p-{p}");
+                let records = vec![Record {
+                    time: Utc::now(),
+                    message: format!("{topic_name}/{part_name}").into_bytes(),
+                }];
+                topic.extend_records(&part_name, &records).await.unwrap();
+            }
+            topic.commit().await.unwrap();
+            // Small delay so MAX(time_end) is monotonically increasing across topics.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_stochastic_samples_requested_counts() -> Result<()> {
+        let (_tmpdir, catalog) = create_test_catalog().await;
+        seed_topics(&catalog, 6, 4).await;
+        catalog.checkpoint().await;
+
+        let config = ReconcileConfig {
+            track_files: true,
+            sampling: SamplingStrategy::Stochastic {
+                topics: 3,
+                partitions: 2,
+            },
+            ..Default::default()
+        };
+        let mut reconciler = ReconcileJob::with_config(catalog.clone(), config);
+
+        reconciler.pass().await?;
+
+        // The plan should contain exactly the requested counts; each chosen
+        // topic should be distinct and each partition list distinct within it.
+        let plan = reconciler.state.work.as_ref().expect("plan was built");
+        assert_eq!(plan.len(), 3, "expected 3 sampled topics");
+        let mut seen_topics: BTreeSet<&str> = BTreeSet::new();
+        for (topic, parts) in plan {
+            assert!(seen_topics.insert(topic.as_str()), "duplicate topic {topic}");
+            assert_eq!(parts.len(), 2, "expected 2 partitions for {topic}");
+            let unique: BTreeSet<&str> = parts.iter().map(String::as_str).collect();
+            assert_eq!(unique.len(), 2, "duplicate partitions for {topic}");
+        }
+
+        // Validation must have happened against real segments on disk: sizes
+        // accumulate and no missing / size-mismatch findings are produced.
+        let stats = reconciler.stats();
+        assert!(
+            stats.expected_size.as_u64() > 0,
+            "expected_size should accumulate from sampled segments"
+        );
+        assert_eq!(stats.expected_size, stats.actual_size);
+        assert_eq!(stats.missing_files.len(), 0);
+        assert_eq!(stats.size_mismatches.len(), 0);
+        // Stochastic mode deliberately skips the orphan-file scan.
+        assert_eq!(stats.untracked_files.len(), 0);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_stochastic_biases_toward_newer_topics() -> Result<()> {
+        let (_tmpdir, catalog) = create_test_catalog().await;
+        let n_topics = 8;
+        seed_topics(&catalog, n_topics, 1).await;
+        catalog.checkpoint().await;
+
+        // Older half = topic-0..3, newer half = topic-4..7.
+        // With harmonic weights `1/(rank+1)` over the newest-first ordering,
+        // the top 4 ranks (newer half) get cumulative weight
+        // 1 + 1/2 + 1/3 + 1/4 ≈ 2.083, vs. older 1/5+...+1/8 ≈ 0.635 — newer
+        // topics should be sampled ~3x as often.
+        let mut newer_hits = 0u32;
+        let mut older_hits = 0u32;
+        let trials = 200;
+        for _ in 0..trials {
+            let config = ReconcileConfig {
+                track_files: true,
+                sampling: SamplingStrategy::Stochastic {
+                    topics: 1,
+                    partitions: 1,
+                },
+                ..Default::default()
+            };
+            let reconciler = ReconcileJob::with_config(catalog.clone(), config);
+            let work = reconciler.plan_work().await;
+            assert_eq!(work.len(), 1);
+            let topic_ix: usize = work[0]
+                .0
+                .strip_prefix("topic-")
+                .unwrap()
+                .parse()
+                .unwrap();
+            if topic_ix >= n_topics / 2 {
+                newer_hits += 1;
+            } else {
+                older_hits += 1;
+            }
+        }
+        // Generous bound to avoid flakes: newer half should clearly dominate.
+        assert!(
+            newer_hits > older_hits * 2,
+            "expected newer topics to be sampled at least 2x as often; got newer={newer_hits} older={older_hits}"
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_stochastic_skips_orphan_check() -> Result<()> {
+        // With stochastic sampling we may not visit every partition in a topic,
+        // so files belonging to unvisited partitions must NOT be flagged as
+        // orphans. The equivalent `All` pass over the same data would also see
+        // zero orphans, but it WOULD populate `files_checked` from the topic
+        // directory scan — which stochastic mode skips by design.
+        let (_tmpdir, catalog) = create_test_catalog().await;
+        seed_topics(&catalog, 1, 4).await;
+        catalog.checkpoint().await;
+
+        let config = ReconcileConfig {
+            track_files: true,
+            sampling: SamplingStrategy::Stochastic {
+                topics: 1,
+                partitions: 1, // only one of the four partitions visited
+            },
+            ..Default::default()
+        };
+        let mut reconciler = ReconcileJob::with_config(catalog.clone(), config);
+        reconciler.pass().await?;
+
+        let stats = reconciler.stats();
+        assert_eq!(stats.untracked_files.len(), 0);
+        // No directory scan ⇒ files_checked stays empty, but a real segment
+        // was validated which shows up in expected_size.
+        assert_eq!(stats.files_checked.len(), 0);
+        assert!(stats.expected_size.as_u64() > 0);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_stochastic_zero_request_is_noop() -> Result<()> {
+        let (_tmpdir, catalog) = create_test_catalog().await;
+        seed_topics(&catalog, 3, 2).await;
+        catalog.checkpoint().await;
+
+        let config = ReconcileConfig {
+            track_files: true,
+            sampling: SamplingStrategy::Stochastic {
+                topics: 0,
+                partitions: 5,
+            },
+            ..Default::default()
+        };
+        let mut reconciler = ReconcileJob::with_config(catalog, config);
+        reconciler.pass().await?;
+        assert_eq!(reconciler.stats().files_checked.len(), 0);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_all_strategy_is_default() {
+        let config = ReconcileConfig::default();
+        assert!(matches!(config.sampling, SamplingStrategy::All));
     }
 }

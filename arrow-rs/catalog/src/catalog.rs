@@ -16,13 +16,13 @@ use tokio::{
     sync::{RwLock, RwLockReadGuard},
     time,
 };
-use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::data::limit::Retention;
 use crate::manifest::Manifest;
 use crate::manifest::Scope;
 use crate::partition;
+use crate::reconcile::{ReconcileConfig, ReconcileJob, SamplingStrategy};
 use crate::storage::{self, DiskMonitor};
 use crate::topic::Topic;
 
@@ -206,17 +206,36 @@ impl Catalog {
     }
 
     pub async fn checkpoints(catalog: Arc<Self>) {
-        use futures::stream::StreamExt;
+        Self::checkpoints_with_reconcile(catalog, None).await
+    }
+
+    /// Run the periodic checkpoint + retention loop, optionally interleaving a
+    /// stochastic reconciliation pass on each tick.
+    ///
+    /// The reconcile pass only runs when the supplied config uses a
+    /// [`SamplingStrategy::Stochastic`] strategy; full (`All`) reconciles are
+    /// expensive and are expected to be driven once at startup rather than
+    /// per-tick.
+    pub async fn checkpoints_with_reconcile(
+        catalog: Arc<Self>,
+        reconcile: Option<ReconcileConfig>,
+    ) {
+        let mut reconcile_job = reconcile
+            .filter(|c| matches!(c.sampling, SamplingStrategy::Stochastic { .. }))
+            .map(|c| ReconcileJob::with_config(catalog.clone(), c));
 
         let mut checkpoints = time::interval(catalog.config.checkpoint_interval);
         checkpoints.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        IntervalStream::new(checkpoints)
-            .for_each(|_| async {
-                let r = catalog.as_ref();
-                r.checkpoint().await;
-                r.retain().await;
-            })
-            .await;
+        loop {
+            checkpoints.tick().await;
+            catalog.checkpoint().await;
+            catalog.retain().await;
+            if let Some(job) = reconcile_job.as_mut() {
+                if let Err(e) = job.pass().await {
+                    warn!("stochastic reconcile pass error: {:?}", e);
+                }
+            }
+        }
     }
 
     pub async fn retain(&self) {
