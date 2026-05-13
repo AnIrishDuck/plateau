@@ -2,188 +2,246 @@
 
 ## Goal
 
-A `plateau-cli s3-sync` subcommand that copies local segments to S3 (and
-S3-compatible object stores). It's a one-shot, incremental sync:
+Add a `ReplicateCatalogJob` to the existing `client/src/replicate.rs`
+worker. It ships segments from a source plateau host (over HTTP) to an
+S3 bucket. A `plateau-cli replicate` subcommand builds a
+`ReplicationWorker` and calls `pump()` once, so the same code path that
+the server thread uses for record replication also serves CLI-driven
+S3 sync.
 
-- Run it once → it mirrors current state.
-- Run it again later → it only uploads what's new or changed.
-- Interrupted → re-running picks up where it left off.
+The CLI runs **remotely** — its only inputs are a source host URL, an
+S3 endpoint/bucket, and credentials. No filesystem or manifest access.
 
-The operator (or a cron / systemd timer) drives it. No background thread
-in the server, no new server endpoints, no manifest schema changes.
+## Architecture (what fits where)
 
-## How this fits with existing replication
+This is the constraint that drives everything:
 
-The existing `client/src/replicate.rs` is a host-to-host record-shipping
-worker driven by a `pump()`-once method and wrapped in
-`run_forever()` for the server-side thread (`server/src/replication.rs`).
+- **Existing `ReplicationWorker`** in `client/src/replicate.rs` is the
+  orchestrator. It already holds `topics` and `partitions` maps of
+  jobs and pumps them in parallel via `page_all()`.
+- **Existing `Client`** wraps the plateau HTTP API. The new job uses it
+  for *source*-side reads.
+- **New `ReplicateCatalogJob`** sits alongside `ReplicateTopicJob` and
+  `ReplicatePartitionJob` in the same module. Its `page()` follows the
+  same shape: do one unit of work, return `Ok(true)` when caught up.
+- **New `S3Target`** is a small wrapper used only by
+  `ReplicateCatalogJob` for sink writes. It is **not** a peer of
+  `Client` in the worker's `hosts` map — the existing host plumbing is
+  HTTP-only.
+- **New CLI subcommand** is a ~50-line wrapper: parse config →
+  `ReplicationWorker::from_replicate(...)` → `worker.pump().await` →
+  exit. It exercises the same constructor as the server thread.
 
-We reuse its **shape** — config struct, worker, job, `pump()` —
-but the new job ships *finalized segments* to *S3* instead of *records*
-to a *peer host*. The server thread is untouched. The CLI calls
-`pump()` exactly once and exits.
-
-## Why CLI, not server thread
-
-- No long-running thread to monitor or restart.
-- No fight over the SQLite DB — manifest is in WAL mode, so an external
-  read-only opener is safe.
-- Trivial to run on-demand, against a snapshot, or from a different host
-  that has the data directory mounted.
-- "Incremental" falls out for free: **S3 itself is the replication
-  cursor**. List+HEAD what's already there, upload what isn't.
+What we are **not** doing:
+- Not building a parallel worker.
+- Not reading the local manifest or local segment files.
+- Not changing the manifest schema.
+- Not changing `run_forever()` or the server-side replication thread.
 
 ## What gets uploaded
 
-Two categories, both driven by the local manifest:
+Source defines the truth; the CLI is a thin pump.
 
-1. **Finalized segments** (`segments.size IS NOT NULL`). Immutable once
-   uploaded — skip if the key exists in S3 with matching size/etag.
-2. **The active segment** (the one currently being written, `size` not
-   yet finalized in the manifest). Re-upload on every run because its
-   bytes are still growing. The "overwrite active segments" semantics
-   the user asked about: each sync overwrites the S3 copy of the active
-   segment with the current local bytes. Once it finalizes, it joins
-   category 1 and stops being re-uploaded.
+- **Finalized segments** (manifest says `size` is set, `time_end`
+  is in the past): uploaded once. Idempotent — `HEAD` first, skip if
+  size matches.
+- **The active segment** (still being appended): uploaded on every
+  pump and overwritten in S3. The user's "overwrite any active
+  segments" requirement maps here. Once it finalizes, it joins the
+  finalized set and stops being re-uploaded.
 
-Reading a still-growing segment file gives a consistent byte prefix
-because the slog writer only appends and fsyncs whole chunks. The S3
-object will be a valid-up-to-some-suffix copy until the segment seals.
+Incrementality across CLI invocations falls out of `HEAD`-first
+behavior — the S3 listing *is* the cursor. No state file, no manifest
+changes.
 
 ---
 
 ## Work chunks
 
-Three PRs, ordered. Each is independently reviewable.
+Four PRs. Chunk 4 is genuinely small because it's just a CLI mount of
+the existing constructor.
 
-### Chunk 1 — S3 client wrapper + config
+### Chunk 1 — HTTP endpoints for segment access (server)
 
-**Scope:** Pure I/O layer, no plateau integration.
+**Scope:** Read-side endpoints the new job will call. Server-only PR.
 
-- Pick the backend: prefer the `object_store` crate (already in the
-  arrow-rs dependency graph) unless it pulls something heavy we don't
-  want — fall back to `aws-sdk-s3` if so. Decide in this PR.
-- Thin wrapper exposing only what we need:
-  - `head(key) -> Result<Option<ObjectMeta>>` (size, etag)
-  - `put(key, AsyncRead, size) -> Result<()>` (multipart automatically
-    above N MB)
-  - `list(prefix) -> Stream<ObjectMeta>` (for reconciliation)
-- Config struct, serde-ready:
-  - `endpoint`, `region`, `bucket`, `prefix` (key namespace)
-  - `credentials`: env / IMDS / static
-  - `path_style: bool`, `multipart_threshold: ByteSize`
-- Add to a new module in `client/src/s3.rs` (or a new `s3` crate if it
-  bloats `client`).
+Add to `server/src/http.rs`:
 
-**DoD:** unit tests with a mock backend; one `#[ignore]` integration
-test against MinIO in docker.
+- `GET /topic/:topic/partition/:partition/segments` →
+  `Vec<SegmentInfo>` (`segment_index`, `time_start`, `time_end`,
+  `record_start`, `record_end`, `size`, `version`, `is_active: bool`).
+  Backed by a new `Manifest` query that returns finalized + the active
+  segment in one shot.
+- `GET /topic/:topic/partition/:partition/segment/:index` → streams
+  the raw segment file bytes (`Content-Type: application/octet-stream`,
+  `Content-Length` set for finalized segments, chunked for active).
+- New transport types in `transport/src/`: `SegmentInfo`, list query
+  params (`start_index`, `limit`).
+- These mirror the read-only side of how `Catalog`/`Manifest` already
+  expose data internally; no new lifecycle code.
 
-### Chunk 2 — Segment-sync job + worker integration
+**DoD:** OpenAPI doc updated; integration tests in `server/tests/`
+covering finalized + active segment fetches and the listing endpoint.
 
-**Scope:** The actual sync logic, no CLI wiring yet.
+### Chunk 2 — S3 target wrapper
 
-- New module `client/src/replicate_s3.rs` (sibling of `replicate.rs` —
-  do *not* graft S3 into the existing `ReplicationWorker`; the data
-  flow is fundamentally different (filesystem+sqlite vs HTTP) and
-  mashing them together obscures both).
-- Reuse the patterns from `replicate.rs`:
-  - `S3Replicate` config: data path, manifest path, S3 config,
-    `topics: Vec<TopicFilter>`, `parallel: usize`, `include_active:
-    bool` (default `true`).
-  - `S3ReplicationWorker` with a `pump()` that returns when nothing
-    more needs uploading this pass.
-  - `S3PartitionJob` analogous to `ReplicatePartitionJob` —
-    one per (topic, partition).
-- Each `S3PartitionJob::page()`:
-  1. Open manifest read-only (separate `SqlitePool`, `read_only=true`).
-     Query segments for this partition ordered by `segment_index`.
-  2. For each finalized segment beyond the job's cursor: `HEAD` the
-     target key. If present with matching size, advance the cursor and
-     continue. Otherwise `PUT` the segment file, then advance.
-  3. Active segment (if `include_active`): always `PUT` (overwrite).
-     Don't advance the cursor — next pass will re-upload.
-  4. Return `done = true` when all finalized segments past cursor are
-     uploaded and the active segment (if any) has been pushed once
-     this pass.
-- Key layout (this is a public contract — pin it now):
-  `{prefix}/{topic}/{partition}/{segment_index:020}.{ext}`
-  where `ext` is the on-disk file extension (`feather` or `parquet`).
-  Side-car files (e.g. `.arrows` cache) are **not** uploaded. If a
-  segment has multiple on-disk parts, upload each with a suffix:
-  `.../{segment_index:020}.part-{n}.{ext}`. Document this clearly.
-- Concurrency: bounded parallelism via `FuturesUnordered`, copy the
-  pattern from `ReplicationWorker::page_all`.
-- Skip detection: an `S3Object` is considered "up to date" if its size
-  equals the manifest's `segments.size` for that index. For the active
-  segment we can't compare against the manifest (size is NULL there),
-  so we always re-upload. Optionally compare against the on-disk file
-  size to skip when no growth has happened — nice-to-have for v1.1.
+**Scope:** Pure I/O, no replication wiring.
 
-**DoD:** library-level tests using a fake object store from chunk 1,
-covering: fresh sync, idempotent re-run (no extra uploads), partial
-prior run (interruption recovery), active segment re-uploaded.
+- New module `client/src/s3.rs` (gated behind a `s3` cargo feature so
+  the existing `replicate` feature doesn't pull in AWS deps when not
+  needed).
+- Decide between the `object_store` crate (already transitively in
+  arrow-rs deps) and `aws-sdk-s3`. Recommend `object_store` for the
+  smaller surface and built-in multipart.
+- `S3Target` type exposing only what `ReplicateCatalogJob` needs:
+  - `head(key) -> Result<Option<ObjectMeta>>`
+  - `put_streaming(key, AsyncRead, content_length: Option<u64>)`
+  - `list(prefix) -> Stream<ObjectMeta>` (used for catch-up listing at
+    job-begin)
+- Serde config (`S3Config`): `endpoint`, `region`, `bucket`, `prefix`,
+  credentials (env / IMDS / static), `path_style`, `multipart_threshold`.
 
-### Chunk 3 — CLI subcommand
+**DoD:** unit tests against a mock; one `#[ignore]` test against MinIO.
 
-**Scope:** Make it runnable.
+### Chunk 3 — `ReplicateCatalogJob` in `replicate.rs`
 
-- Add to `cli/src/main.rs`:
+**Scope:** This is the actual extension the user asked for.
+
+Add to `client/src/replicate.rs`, alongside the existing job types:
+
+```rust
+#[derive(Clone, Debug)]
+pub struct ReplicateCatalogJob {
+    source: ClientPartition,
+    target: S3Target,
+    key_prefix: String,
+    include_active: bool,
+    next_index: SegmentIndex,   // cursor for finalized segments
+}
+```
+
+- `begin()`: list the S3 prefix once to derive `next_index` (highest
+  contiguous finalized segment already present + 1). This makes
+  resume-after-interruption automatic.
+- `page()`:
+  1. Call `client.list_segments(topic, partition, start=next_index)`
+     against the source.
+  2. For each finalized segment past the cursor: `HEAD` S3, skip if
+     size matches, otherwise stream `get_segment_bytes` → `put_streaming`,
+     then advance `next_index`.
+  3. If `include_active` and the listing includes an active segment:
+     stream + overwrite at its key. Do not advance the cursor.
+  4. Return `Ok(true)` when nothing was uploaded this call.
+- Config extension to `Replicate`:
+  ```rust
+  pub struct Replicate {
+      pub config: Config,
+      pub hosts: Vec<ReplicateHost>,
+      pub topics: Vec<ReplicateTopic>,
+      pub partitions: Vec<ReplicatePartition>,
+      #[serde(default)]
+      pub s3_targets: Vec<S3TargetConfig>,   // named, like hosts
+      #[serde(default)]
+      pub catalogs: Vec<ReplicateCatalog>,   // new job entries
+  }
+
+  pub struct ReplicateCatalog {
+      pub source: HostPartition,        // reuse existing type
+      pub target: String,               // s3_targets key
+      pub key_prefix: Option<String>,   // default: "{topic}/{partition}"
+      pub include_active: bool,         // default: true
+  }
   ```
-  plateau-cli s3-sync --config s3-replication.yaml
-  plateau-cli s3-sync --data-path PATH --bucket B [--prefix P] \
-                     [--endpoint URL] [--topic T]... [--once]
-  ```
-- The `--config` form deserializes an `S3Replicate` and calls
-  `worker.pump()` once.
-- The flag form is for ad-hoc / one-off runs without a config file.
+- `ReplicationWorker` extension:
+  - Add `s3_targets: HashMap<String, S3Target>` and
+    `catalogs: HashMap<CatalogKey, ReplicateCatalogJob>` fields.
+  - `from_replicate()` constructs them.
+  - `page_all()` adds a third loop that pushes catalog-job futures
+    into the same `FuturesUnordered`, respecting `config.parallel`.
+  - `all_jobs()` iterator returns catalog jobs too for start/end
+    logging.
+- Key layout: `{key_prefix}/{segment_index:020}.{ext}` where `ext` is
+  the segment's on-disk file extension (`feather` or `parquet`).
+  Multi-part segments → `…/{index:020}.part-{n}.{ext}`. Pin this now
+  as a public contract.
+
+**DoD:** integration test in `client/tests/` (or extend the existing
+replicate tests) that spins up a plateau server, writes records to
+roll a few segments, runs the worker, and asserts the expected S3
+keys land — then rolls more, re-runs, asserts only the new ones are
+uploaded.
+
+### Chunk 4 — `plateau-cli replicate` subcommand
+
+**Scope:** Trivial wrapper.
+
+Add to `cli/src/main.rs`:
+
+```
+plateau-cli replicate --config replicate.yaml
+plateau-cli replicate --config replicate.yaml --once   # default
+plateau-cli replicate --config replicate.yaml --watch  # opt-in run_forever
+```
+
+- Deserializes a `Replicate` (the same struct the server-side config
+  uses).
+- Calls `ReplicationWorker::from_replicate(...).pump().await` for the
+  one-shot case, or `run_forever()` for `--watch`.
 - Exit codes:
-  - 0: success, everything in sync.
-  - 1: error (S3 unreachable, permission denied, etc.).
-  - 2: partial — some uploads failed but the run made forward
-    progress. Suitable for cron retry.
-- Logging: per-segment INFO, per-partition summary at end, totals
-  (bytes uploaded, segments uploaded, segments skipped).
-- Document running as a cron / systemd timer in the example config.
+  - 0 — all jobs caught up.
+  - 1 — config / connectivity error.
+  - 2 — partial: some jobs errored but others made progress (suitable
+    for cron retry).
+- Logs per-job summary at end: segments uploaded, segments skipped,
+  bytes.
+- A worked example config in `examples/replicate-s3.yaml` showing both
+  record-shipping and catalog-to-S3 jobs in one file.
 
-**DoD:** smoke test invokes the CLI against a fake object store and a
-prepared data dir, asserts segments land at the expected keys.
+**DoD:** smoke test invokes the CLI binary against a fake S3 backend
+and a plateau test server; asserts uploads and clean exit.
 
 ---
 
 ## Sequencing
 
 ```
-1 (s3 client) → 2 (sync job) → 3 (CLI)
+1 (endpoints) ──┐
+                ├──► 3 (catalog job) ──► 4 (CLI)
+2 (s3 target) ──┘
 ```
 
-Strictly serial — each chunk's tests need the prior chunk.
+Chunks 1 and 2 are independent and can be reviewed in parallel.
 
-## Open questions to resolve before chunk 2
+## Open questions to resolve before chunk 3
 
-1. **`object_store` crate vs `aws-sdk-s3`.** Investigate during chunk 1.
-2. **Multi-file segments.** Confirm whether real segments have side-cars
-   that need to land in S3 to be usable, or whether the base file alone
-   suffices for a byte-mirror v1. The README hints there's just one
-   primary file per segment; need to verify in `data/src/segment.rs`.
-3. **Concurrent runs.** Two `s3-sync` processes against the same data
-   dir + bucket would race on the active segment. v1: document
-   "don't do that". v1.1: add a `flock`-based lock file in the data
-   dir.
-4. **Manifest opener lock.** WAL mode allows concurrent readers, but
-   the SQLite file must be on a local filesystem (not NFS) for this to
-   be safe. Verify and document.
+1. **`object_store` vs `aws-sdk-s3`** — decide during chunk 2.
+2. **Multi-file segments.** Look at `data/src/segment.rs` to confirm
+   whether a single segment has multiple on-disk files we must upload
+   for the S3 copy to be useful. If yes, the segment-bytes endpoint in
+   chunk 1 must expose all parts (likely as a list of named files, or
+   via `:part` path component); the key layout reflects that.
+3. **Active-segment listing.** Confirm in chunk 1 whether the existing
+   manifest query helpers already differentiate active vs finalized,
+   or whether we need a small SQL addition. No schema change either
+   way.
+4. **Auth on the new endpoints.** They expose raw segment bytes — same
+   trust model as the existing record endpoints, which means whatever
+   front-door auth the operator runs in front of plateau. Document.
 
 ## Risk hotspots
 
-- **Active segment is mid-write.** Reading a growing file yields a
-  consistent prefix, but if the slog writer is mid-chunk-flush the
-  file may end inside an unfinished frame. That's fine for a byte
-  mirror (S3 just has stale bytes until next sync), but if we ever
-  want to read these back from S3, the consumer must tolerate
-  truncated tails.
-- **Large segment uploads.** Use multipart with `AbortMultipartUpload`
-  on drop so a Ctrl-C doesn't leave half-uploaded objects accumulating
-  S3 storage charges.
-- **Retention can delete a segment between manifest query and upload.**
-  Handle `ENOENT` on file open by skipping that segment and logging —
-  not an error.
+- **Active segment is mid-write** when the HTTP stream reads it. The
+  server streams a snapshot of the file as of the open; a growing tail
+  shows up on the next sync. That's fine for a byte mirror. If we ever
+  want to *read* these S3 copies, consumers must tolerate truncated
+  tails.
+- **Multipart upload abort.** Use the `object_store` crate's
+  cancel-on-drop behavior (or `AbortMultipartUpload` explicitly) so
+  Ctrl-C doesn't leave half-uploaded parts incurring storage charges.
+- **Retention races.** A segment listed by the source can be deleted
+  before the bytes endpoint is hit. Handle 404 by dropping that index
+  from this pass and logging — not an error. Next pass picks up the
+  next index naturally.
+- **Concurrent CLIs against the same bucket prefix.** The active
+  segment's PUT becomes a last-writer-wins race. Document; defer a
+  lock to a follow-up.
