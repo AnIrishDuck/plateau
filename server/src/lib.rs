@@ -103,6 +103,10 @@ pub async fn task_from_catalog_config(
             tasks.push(catalog.monitor_disk_storage().boxed());
         }
 
+        if config.catalog.emergency_retain_fraction.is_some() {
+            tasks.push(Catalog::emergency_retain_monitor(catalog.clone()).boxed());
+        }
+
         if let Some(replicate) = config.replication {
             tasks.push(Box::pin(replication::run(replicate, addr)));
         }

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -40,6 +41,16 @@ pub struct Config {
     #[serde(default = "Catalog::default_max_open_topics")]
     pub max_open_topics: usize,
     pub max_partition_bytes: ByteSize,
+    /// Fraction (typically just under 1.0) of the sum
+    /// `retain.max_bytes + storage.min_available` above which an emergency
+    /// retention pass is triggered: oldest segments are removed synchronously
+    /// until catalog size drops below the level, then a full reconcile runs
+    /// asynchronously. `None` disables the trigger.
+    #[serde(default)]
+    pub emergency_retain_fraction: Option<f64>,
+    /// How often the emergency retention monitor polls.
+    #[serde(default = "Catalog::default_emergency_retain_interval", with = "humantime_serde")]
+    pub emergency_retain_interval: Duration,
 }
 
 impl Default for Config {
@@ -53,6 +64,8 @@ impl Default for Config {
             storage: Default::default(),
             max_open_topics: Catalog::default_max_open_topics(),
             max_partition_bytes: ByteSize::mib(3500),
+            emergency_retain_fraction: None,
+            emergency_retain_interval: Catalog::default_emergency_retain_interval(),
         }
     }
 }
@@ -102,6 +115,7 @@ pub struct Catalog {
     topic_root: PathBuf,
     state: RwLock<State>,
     disk_monitor: DiskMonitor,
+    emergency_reconcile_in_flight: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -153,6 +167,7 @@ impl Catalog {
                 last_checkpoint: SystemTime::now(),
             }),
             disk_monitor,
+            emergency_reconcile_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -337,6 +352,117 @@ impl Catalog {
         over
     }
 
+    /// The stored-bytes threshold at which an emergency retention pass triggers.
+    ///
+    /// Sits between the normal retention check (`retain.max_bytes`) and the
+    /// monitor readonly override (which kicks in when free space drops below
+    /// `storage.min_available`). Returns `None` when emergency retention is
+    /// disabled.
+    pub fn emergency_retain_level(&self) -> Option<ByteSize> {
+        let frac = self.config.emergency_retain_fraction?;
+        let ceiling = self
+            .config
+            .retain
+            .max_bytes
+            .0
+            .saturating_add(self.config.storage.min_available.0);
+        Some(ByteSize((ceiling as f64 * frac) as u64))
+    }
+
+    async fn over_emergency_retain_level(&self) -> bool {
+        let Some(level) = self.emergency_retain_level() else {
+            return false;
+        };
+        self.byte_size().await > level
+    }
+
+    /// Synchronously removes the oldest segments until catalog size drops
+    /// below the emergency retain level, then spawns a full reconcile task.
+    ///
+    /// A no-op when emergency retention is not configured or the catalog is
+    /// already below the level. Subsequent calls while a post-emergency
+    /// reconcile is still running will trim but skip spawning another reconcile.
+    pub async fn emergency_retain(catalog: Arc<Self>) {
+        let Some(level) = catalog.emergency_retain_level() else {
+            return;
+        };
+
+        let initial = catalog.byte_size().await;
+        if initial <= level {
+            return;
+        }
+
+        warn!(
+            "emergency retention triggered: catalog size {} > emergency level {}",
+            initial, level
+        );
+
+        while catalog.byte_size().await > level {
+            let oldest = match catalog.manifest.get_oldest_segment(None).await {
+                Some(s) => s,
+                None => {
+                    error!("emergency retention: no segments left to remove");
+                    break;
+                }
+            };
+
+            let topic = catalog.get_topic(oldest.topic()).await;
+            let partition = topic.get_partition(oldest.partition()).await;
+            partition.remove_oldest().await;
+        }
+
+        let after = catalog.byte_size().await;
+        info!(
+            "emergency retention complete: catalog size {} (was {}, level {})",
+            after, initial, level
+        );
+
+        if catalog
+            .emergency_reconcile_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            info!("emergency reconcile already running; skipping spawn");
+            return;
+        }
+
+        let reconcile_catalog = catalog.clone();
+        let flag = catalog.emergency_reconcile_in_flight.clone();
+        tokio::spawn(async move {
+            info!("starting post-emergency full reconcile");
+            let mut reconciler = crate::reconcile::ReconcileJob::new(reconcile_catalog);
+            match reconciler.run(None).await {
+                Ok(_) => info!("post-emergency reconcile complete: {:?}", reconciler.stats()),
+                Err(e) => error!("post-emergency reconcile error: {:?}", e),
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Background task: periodically samples the catalog size and fires
+    /// [`emergency_retain`] whenever the emergency level is exceeded.
+    pub async fn emergency_retain_monitor(catalog: Arc<Self>) {
+        if catalog.config.emergency_retain_fraction.is_none() {
+            std::future::pending::<()>().await;
+            return;
+        }
+
+        let interval = catalog.config.emergency_retain_interval;
+        info!(
+            "emergency retention monitor starting (interval {:?}, level {:?})",
+            interval,
+            catalog.emergency_retain_level()
+        );
+        let mut ticker = time::interval(interval);
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if catalog.over_emergency_retain_level().await {
+                Self::emergency_retain(catalog.clone()).await;
+            }
+        }
+    }
+
     pub async fn list_topics(&self) -> Vec<String> {
         let mem_topics = &self.state.read().await.topics;
         let mut topics: Vec<String> = mem_topics.keys().cloned().collect();
@@ -411,6 +537,11 @@ impl Catalog {
     /// Default number of topics to keep in-memory.
     pub fn default_max_open_topics() -> usize {
         128
+    }
+
+    /// Default polling interval for the emergency retention monitor.
+    pub fn default_emergency_retain_interval() -> Duration {
+        Duration::from_secs(1)
     }
 
     pub async fn close(self) {
@@ -629,6 +760,55 @@ mod test {
         let partition = topic.get_partition("default").await;
         assert!(partition.byte_size().await < old_size);
 
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_emergency_retain() -> Result<()> {
+        let (_root, mut catalog) = catalog().await;
+        // retention ceiling at ~16000 bytes of records, emergency at 50% of
+        // (max_bytes + min_available) = (16000 + 16000) * 0.5 = 16000.
+        catalog.config.retain.max_bytes = ByteSize::b(16000 + catalog.manifest.db_bytes() as u64);
+        catalog.config.headroom = ByteSize::b(0);
+        catalog.config.storage.min_available =
+            ByteSize::b(16000 + catalog.manifest.db_bytes() as u64);
+        catalog.config.emergency_retain_fraction = Some(0.5);
+
+        let level = catalog.emergency_retain_level().expect("level configured");
+
+        let data = "x".to_string().repeat(500);
+        let records = build_records((0..10).map(|_| (0, data.clone())));
+        for ix in 0..5 {
+            let name = format!("topic-{ix}");
+            let topic = catalog.get_topic(&name).await;
+            let partition = topic.get_partition("default").await;
+            partition.extend_records(&records).await?;
+            partition.compact().await;
+            partition.extend_records(&records).await?;
+        }
+
+        assert!(
+            catalog.byte_size().await > level,
+            "test setup must push catalog above the emergency level"
+        );
+        assert!(catalog.over_emergency_retain_level().await);
+
+        let arc = Arc::new(catalog);
+        Catalog::emergency_retain(arc.clone()).await;
+
+        assert!(arc.byte_size().await <= level);
+        assert!(!arc.over_emergency_retain_level().await);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_emergency_retain_disabled() -> Result<()> {
+        let (_root, catalog) = catalog().await;
+        assert_eq!(catalog.emergency_retain_level(), None);
+        assert!(!catalog.over_emergency_retain_level().await);
+        // Should be a no-op without panicking.
+        Catalog::emergency_retain(Arc::new(catalog)).await;
         Ok(())
     }
 
