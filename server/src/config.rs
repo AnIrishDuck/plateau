@@ -6,7 +6,7 @@ use tracing::{error, info};
 
 use crate::{catalog, http, metrics, replication};
 
-use catalog::{reconcile::ReconcileFix, ReconcileConfig};
+use catalog::{reconcile::ReconcileFix, EmergencyReconcileConfig, ReconcileConfig};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +18,7 @@ pub struct PlateauConfig {
     pub metrics: metrics::Config,
     pub replication: Option<replication::Config>,
     pub reconcile: Option<ReconcileConfig>,
+    pub emergency_reconcile: Option<EmergencyReconcileConfig>,
 }
 
 impl PlateauConfig {
@@ -50,6 +51,7 @@ impl Default for PlateauConfig {
                 fixes: [ReconcileFix::UpdateManifestSizes].into(),
                 ..Default::default()
             }),
+            emergency_reconcile: None,
         }
     }
 }

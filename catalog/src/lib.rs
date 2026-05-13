@@ -33,4 +33,4 @@ pub use plateau_transport::arrow2;
 pub use plateau_test as test;
 
 pub use catalog::{Catalog, Config};
-pub use reconcile::{ReconcileConfig, ReconcileJob, ReconcileStats};
+pub use reconcile::{EmergencyReconcileConfig, ReconcileConfig, ReconcileJob, ReconcileStats};

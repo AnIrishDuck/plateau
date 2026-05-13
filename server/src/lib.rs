@@ -103,6 +103,12 @@ pub async fn task_from_catalog_config(
             tasks.push(catalog.monitor_disk_storage().boxed());
         }
 
+        if let Some(emergency_reconcile) = config.emergency_reconcile {
+            tasks.push(
+                Catalog::emergency_reconciliations(catalog.clone(), emergency_reconcile).boxed(),
+            );
+        }
+
         if let Some(replicate) = config.replication {
             tasks.push(Box::pin(replication::run(replicate, addr)));
         }

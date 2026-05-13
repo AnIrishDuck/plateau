@@ -54,6 +54,47 @@ pub enum ReconcileFix {
     // TODO: RemoveUntrackedSegments
 }
 
+/// Configuration for the emergency reconciliation task.
+///
+/// The emergency reconcile level lies between the standard retention threshold
+/// (`max_bytes - headroom`) and the absolute maximum (`max_bytes`, near where
+/// the storage monitor would override into read-only). It is computed as:
+///
+/// ```text
+/// emergency_level = (total_byte_limit + headroom) * threshold_fraction
+///                 = retain.max_bytes * threshold_fraction
+/// ```
+///
+/// A `threshold_fraction` near 1.0 (the default) places the emergency level
+/// just below `max_bytes`. Lower values trigger emergency reconciliation
+/// sooner.
+///
+/// The emergency loop runs in its own dedicated task and polls
+/// `polling_interval`; because there is a single task, only one emergency
+/// reconciliation can be in flight at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmergencyReconcileConfig {
+    /// How often to check whether the catalog has exceeded the emergency level.
+    #[serde(with = "humantime_serde")]
+    pub polling_interval: Duration,
+    /// Fraction of `retain.max_bytes` at which to trigger emergency
+    /// reconciliation. Clamped to `[0.0, 1.0]` when evaluated.
+    pub threshold_fraction: f64,
+    /// Reconcile job configuration to use when emergency reconciliation runs.
+    pub reconcile: ReconcileConfig,
+}
+
+impl Default for EmergencyReconcileConfig {
+    fn default() -> Self {
+        Self {
+            polling_interval: Duration::from_secs(60),
+            threshold_fraction: 0.95,
+            reconcile: ReconcileConfig::default(),
+        }
+    }
+}
+
 /// A reconciliation job that incrementally validates consistency between
 /// the manifest and files on disk.
 #[derive(Debug)]

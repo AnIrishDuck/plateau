@@ -23,6 +23,7 @@ use crate::data::limit::Retention;
 use crate::manifest::Manifest;
 use crate::manifest::Scope;
 use crate::partition;
+use crate::reconcile::{EmergencyReconcileConfig, ReconcileJob};
 use crate::storage::{self, DiskMonitor};
 use crate::topic::Topic;
 
@@ -321,6 +322,64 @@ impl Catalog {
                 .0
                 .saturating_sub(self.config.headroom.0),
         )
+    }
+
+    /// Catalog byte-size threshold at which emergency reconciliation triggers.
+    ///
+    /// Computed as `retain.max_bytes * threshold_fraction`. With
+    /// `threshold_fraction` near 1.0 this sits between the standard retention
+    /// threshold (`total_byte_limit`) and the absolute maximum.
+    pub fn emergency_reconcile_level(&self, threshold_fraction: f64) -> ByteSize {
+        let frac = threshold_fraction.clamp(0.0, 1.0);
+        let max_bytes = self.config.retain.max_bytes.0;
+        ByteSize((max_bytes as f64 * frac) as u64)
+    }
+
+    async fn over_emergency_level(&self, threshold_fraction: f64) -> bool {
+        let size = self.byte_size().await;
+        let level = self.emergency_reconcile_level(threshold_fraction);
+        let over = size > level;
+        gauge!("emergency_reconcile_level_bytes").set(level.as_u64() as f64);
+        if over {
+            info!("over emergency reconcile level {} > {}", size, level);
+        }
+        over
+    }
+
+    /// Long-running task that polls catalog storage usage and triggers a
+    /// reconciliation pass followed by a retention pass whenever usage exceeds
+    /// the emergency reconcile level.
+    ///
+    /// Running this in a dedicated task guarantees that at most one emergency
+    /// reconciliation is in flight at any given time.
+    pub async fn emergency_reconciliations(
+        catalog: Arc<Self>,
+        config: EmergencyReconcileConfig,
+    ) {
+        info!(
+            "starting emergency reconcile task (polling_interval={:?}, threshold_fraction={})",
+            config.polling_interval, config.threshold_fraction
+        );
+        let mut ticker = time::interval(config.polling_interval);
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if !catalog.over_emergency_level(config.threshold_fraction).await {
+                continue;
+            }
+
+            info!("emergency reconcile threshold reached; running reconciliation");
+            let mut job =
+                ReconcileJob::with_config(catalog.clone(), config.reconcile.clone());
+            match job.run(None).await {
+                Ok(_) => info!("emergency reconciliation complete"),
+                Err(e) => error!("emergency reconciliation error: {:?}", e),
+            }
+
+            // Reconciling can correct manifest sizes; force a retention pass
+            // to release any space that becomes eligible for pruning.
+            catalog.retain().await;
+        }
     }
 
     async fn over_retention_limit(&self) -> bool {
@@ -748,6 +807,64 @@ mod test {
             // comes back but does not invoke the byte limit
             assert_eq!(catalog.active_partitions().await, 2);
         }
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_emergency_reconcile_level() -> Result<()> {
+        let (_root, mut catalog) = catalog().await;
+        catalog.config.retain.max_bytes = ByteSize::mib(1120);
+        catalog.config.headroom = ByteSize::mib(120);
+
+        assert_eq!(catalog.total_byte_limit(), ByteSize::mib(1000));
+
+        // frac == 1.0 -> at max_bytes
+        assert_eq!(
+            catalog.emergency_reconcile_level(1.0),
+            catalog.config.retain.max_bytes
+        );
+
+        // frac near 1 -> between retention threshold and max_bytes
+        let level = catalog.emergency_reconcile_level(0.95);
+        assert!(level > catalog.total_byte_limit());
+        assert!(level < catalog.config.retain.max_bytes);
+
+        // out-of-range values are clamped
+        assert_eq!(catalog.emergency_reconcile_level(-1.0), ByteSize::b(0));
+        assert_eq!(
+            catalog.emergency_reconcile_level(2.0),
+            catalog.config.retain.max_bytes
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_emergency_reconcile_trigger() -> Result<()> {
+        let (_root, mut catalog) = catalog().await;
+        let db_bytes = catalog.manifest.db_bytes() as u64;
+        catalog.config.retain.max_bytes = ByteSize::b(8000 + db_bytes);
+        catalog.config.headroom = ByteSize::b(0);
+
+        // No data yet -> well below the emergency level at high fractions.
+        assert!(!catalog.over_emergency_level(1.0).await);
+
+        let data = "x".to_string().repeat(500);
+        let records = build_records((0..10).map(|_| (0, data.clone())));
+        let topic = catalog.get_topic("t").await;
+        let partition = topic.get_partition("default").await;
+        partition.extend_records(&records).await?;
+        partition.compact().await;
+        partition.extend_records(&records).await?;
+        drop(partition);
+        drop(topic);
+
+        // With a low fraction the catalog is now past the emergency level.
+        assert!(catalog.over_emergency_level(0.1).await);
+        // With a fraction at 1.0 the emergency level equals max_bytes and
+        // should not be exceeded by the half-filled catalog.
+        assert!(!catalog.over_emergency_level(1.0).await);
 
         Ok(())
     }
