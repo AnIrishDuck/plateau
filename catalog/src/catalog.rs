@@ -314,6 +314,7 @@ impl Catalog {
         ByteSize::b(self.manifest.get_size(Scope::Global).await as u64)
     }
 
+    /// Catalog byte-size threshold at which standard retention would trigger.
     pub fn total_byte_limit(&self) -> ByteSize {
         ByteSize(
             self.config
@@ -324,33 +325,60 @@ impl Catalog {
         )
     }
 
-    /// Catalog byte-size threshold at which emergency reconciliation triggers.
+    /// Most recently observed available bytes on the underlying mount,
+    /// as reported by the storage monitor. `None` until the first poll.
+    pub fn latest_available_bytes(&self) -> Option<ByteSize> {
+        self.disk_monitor.available_bytes()
+    }
+
+    /// Filesystem-available-bytes threshold below which emergency
+    /// reconciliation triggers.
     ///
-    /// Computed as `retain.max_bytes * threshold_fraction`. With
-    /// `threshold_fraction` near 1.0 this sits between the standard retention
-    /// threshold (`total_byte_limit`) and the absolute maximum.
-    pub fn emergency_reconcile_level(&self, threshold_fraction: f64) -> ByteSize {
+    /// Lives in the same "available bytes" space as the storage monitor so
+    /// that the trigger is driven by ground truth from `statfs` rather than
+    /// the manifest's running totals (which are the very thing we may need
+    /// to repair). Computed as:
+    ///
+    /// ```text
+    /// threshold = (headroom + min_available) * threshold_fraction
+    /// ```
+    ///
+    /// where `headroom` is the standard retention safety margin and
+    /// `min_available` is the read-only cutoff from the storage monitor.
+    /// With the default `threshold_fraction = 0.5` the threshold sits
+    /// halfway between the read-only cutoff (low end) and roughly where
+    /// retention would have kicked in (high end).
+    pub fn emergency_reconcile_threshold(&self, threshold_fraction: f64) -> ByteSize {
         let frac = threshold_fraction.clamp(0.0, 1.0);
-        let max_bytes = self.config.retain.max_bytes.0;
-        ByteSize((max_bytes as f64 * frac) as u64)
+        let headroom = self.config.headroom.0;
+        let min_available = self.config.storage.min_available.0;
+        ByteSize(((headroom.saturating_add(min_available)) as f64 * frac) as u64)
     }
 
-    async fn over_emergency_level(&self, threshold_fraction: f64) -> bool {
-        let size = self.byte_size().await;
-        let level = self.emergency_reconcile_level(threshold_fraction);
-        let over = size > level;
-        if over {
-            info!("over emergency reconcile level {} > {}", size, level);
+    fn under_emergency_threshold(&self, threshold_fraction: f64) -> bool {
+        let Some(avail) = self.latest_available_bytes() else {
+            return false;
+        };
+        let threshold = self.emergency_reconcile_threshold(threshold_fraction);
+        let under = avail < threshold;
+        if under {
+            info!(
+                "available disk under emergency reconcile threshold {} < {}",
+                avail, threshold
+            );
         }
-        over
+        under
     }
 
-    /// Long-running task that polls catalog storage usage and triggers a
-    /// reconciliation pass followed by a retention pass whenever usage exceeds
-    /// the emergency reconcile level.
+    /// Long-running task that polls the storage monitor's available-bytes
+    /// signal and triggers a reconciliation pass followed by a retention
+    /// pass whenever the available bytes drop below the emergency
+    /// threshold.
     ///
-    /// Running this in a dedicated task guarantees that at most one emergency
-    /// reconciliation is in flight at any given time.
+    /// Running this in a dedicated task (separate from the storage monitor)
+    /// guarantees that at most one emergency reconciliation is in flight at
+    /// any given time, and that a long reconciliation never delays the
+    /// monitor's read-only gating.
     pub async fn emergency_reconciliations(
         catalog: Arc<Self>,
         config: EmergencyReconcileConfig,
@@ -363,7 +391,7 @@ impl Catalog {
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if !catalog.over_emergency_level(config.threshold_fraction).await {
+            if !catalog.under_emergency_threshold(config.threshold_fraction) {
                 continue;
             }
 
@@ -811,59 +839,70 @@ mod test {
     }
 
     #[test(tokio::test)]
-    async fn test_emergency_reconcile_level() -> Result<()> {
+    async fn test_emergency_reconcile_threshold() -> Result<()> {
         let (_root, mut catalog) = catalog().await;
-        catalog.config.retain.max_bytes = ByteSize::mib(1120);
-        catalog.config.headroom = ByteSize::mib(120);
+        catalog.config.headroom = ByteSize::gib(1);
+        catalog.config.storage.min_available = ByteSize::mib(120);
 
-        assert_eq!(catalog.total_byte_limit(), ByteSize::mib(1000));
+        // halfway between min_available and (headroom + min_available)
+        // -> (1Gi + 120Mi) / 2
+        let expected_mid = ByteSize::b(
+            (ByteSize::gib(1).as_u64() + ByteSize::mib(120).as_u64()) / 2,
+        );
+        assert_eq!(catalog.emergency_reconcile_threshold(0.5), expected_mid);
 
-        // frac == 1.0 -> at max_bytes
+        // frac = 0 -> threshold is 0 (never triggers)
         assert_eq!(
-            catalog.emergency_reconcile_level(1.0),
-            catalog.config.retain.max_bytes
+            catalog.emergency_reconcile_threshold(0.0),
+            ByteSize::b(0)
         );
 
-        // frac near 1 -> between retention threshold and max_bytes
-        let level = catalog.emergency_reconcile_level(0.95);
-        assert!(level > catalog.total_byte_limit());
-        assert!(level < catalog.config.retain.max_bytes);
-
         // out-of-range values are clamped
-        assert_eq!(catalog.emergency_reconcile_level(-1.0), ByteSize::b(0));
         assert_eq!(
-            catalog.emergency_reconcile_level(2.0),
-            catalog.config.retain.max_bytes
+            catalog.emergency_reconcile_threshold(-1.0),
+            ByteSize::b(0)
+        );
+        assert_eq!(
+            catalog.emergency_reconcile_threshold(2.0),
+            catalog.emergency_reconcile_threshold(1.0),
         );
 
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
-    async fn test_emergency_reconcile_trigger() -> Result<()> {
+    #[test(tokio::test)]
+    async fn test_emergency_reconcile_trigger_uses_monitor_signal() -> Result<()> {
         let (_root, mut catalog) = catalog().await;
-        let db_bytes = catalog.manifest.db_bytes() as u64;
-        catalog.config.retain.max_bytes = ByteSize::b(8000 + db_bytes);
-        catalog.config.headroom = ByteSize::b(0);
+        catalog.config.headroom = ByteSize::gib(1);
+        catalog.config.storage.min_available = ByteSize::mib(120);
 
-        // No data yet -> well below the emergency level at high fractions.
-        assert!(!catalog.over_emergency_level(1.0).await);
+        // No reading from the monitor yet -> never under threshold.
+        assert!(catalog.latest_available_bytes().is_none());
+        assert!(!catalog.under_emergency_threshold(0.5));
 
-        let data = "x".to_string().repeat(500);
-        let records = build_records((0..10).map(|_| (0, data.clone())));
-        let topic = catalog.get_topic("t").await;
-        let partition = topic.get_partition("default").await;
-        partition.extend_records(&records).await?;
-        partition.compact().await;
-        partition.extend_records(&records).await?;
-        drop(partition);
-        drop(topic);
+        // Plenty of space available -> above threshold.
+        catalog
+            .disk_monitor
+            .set_available_bytes_for_test(ByteSize::gib(10));
+        assert_eq!(
+            catalog.latest_available_bytes(),
+            Some(ByteSize::gib(10))
+        );
+        assert!(!catalog.under_emergency_threshold(0.5));
 
-        // With a low fraction the catalog is now past the emergency level.
-        assert!(catalog.over_emergency_level(0.1).await);
-        // With a fraction at 1.0 the emergency level equals max_bytes and
-        // should not be exceeded by the half-filled catalog.
-        assert!(!catalog.over_emergency_level(1.0).await);
+        // Drop available bytes just below the read-only cutoff.
+        catalog
+            .disk_monitor
+            .set_available_bytes_for_test(ByteSize::mib(100));
+        assert!(catalog.under_emergency_threshold(0.5));
+
+        // Between min_available and headroom: triggers at the default 0.5
+        // but not at a low fraction.
+        catalog
+            .disk_monitor
+            .set_available_bytes_for_test(ByteSize::mib(400));
+        assert!(catalog.under_emergency_threshold(0.5));
+        assert!(!catalog.under_emergency_threshold(0.1));
 
         Ok(())
     }

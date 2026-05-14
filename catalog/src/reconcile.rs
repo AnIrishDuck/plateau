@@ -56,29 +56,31 @@ pub enum ReconcileFix {
 
 /// Configuration for the emergency reconciliation task.
 ///
-/// The emergency reconcile level lies between the standard retention threshold
-/// (`max_bytes - headroom`) and the absolute maximum (`max_bytes`, near where
-/// the storage monitor would override into read-only). It is computed as:
+/// The emergency loop polls the storage monitor's most recent
+/// available-bytes reading and runs a reconciliation (followed by a
+/// retention pass) whenever available bytes drop below:
 ///
 /// ```text
-/// emergency_level = (total_byte_limit + headroom) * threshold_fraction
-///                 = retain.max_bytes * threshold_fraction
+/// threshold = (headroom + min_available) * threshold_fraction
 /// ```
 ///
-/// A `threshold_fraction` near 1.0 (the default) places the emergency level
-/// just below `max_bytes`. Lower values trigger emergency reconciliation
-/// sooner.
+/// where `headroom` is the catalog retention safety margin and
+/// `min_available` is the storage monitor's read-only cutoff. With the
+/// default `threshold_fraction = 0.5` the threshold sits halfway between
+/// the read-only cutoff and the point where standard retention would
+/// already be working to free space.
 ///
-/// The emergency loop runs in its own dedicated task and polls
-/// `polling_interval`; because there is a single task, only one emergency
-/// reconciliation can be in flight at a time.
+/// The loop runs in its own dedicated task — separate from the storage
+/// monitor so that a long reconciliation never delays read-only gating —
+/// and a single task guarantees only one emergency reconciliation runs at
+/// a time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmergencyReconcileConfig {
-    /// How often to check whether the catalog has exceeded the emergency level.
+    /// How often to check the storage monitor's available-bytes signal.
     #[serde(with = "humantime_serde")]
     pub polling_interval: Duration,
-    /// Fraction of `retain.max_bytes` at which to trigger emergency
+    /// Fraction of `headroom + min_available` at which to trigger emergency
     /// reconciliation. Clamped to `[0.0, 1.0]` when evaluated.
     pub threshold_fraction: f64,
     /// Reconcile job configuration to use when emergency reconciliation runs.
@@ -89,7 +91,7 @@ impl Default for EmergencyReconcileConfig {
     fn default() -> Self {
         Self {
             polling_interval: Duration::from_secs(60),
-            threshold_fraction: 0.95,
+            threshold_fraction: 0.5,
             reconcile: ReconcileConfig::default(),
         }
     }
