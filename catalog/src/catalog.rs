@@ -339,7 +339,6 @@ impl Catalog {
         let size = self.byte_size().await;
         let level = self.emergency_reconcile_level(threshold_fraction);
         let over = size > level;
-        gauge!("emergency_reconcile_level_bytes").set(level.as_u64() as f64);
         if over {
             info!("over emergency reconcile level {} > {}", size, level);
         }
