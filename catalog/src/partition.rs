@@ -21,8 +21,6 @@
 use std::fs;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::data::{
@@ -59,12 +57,12 @@ pub struct Partition {
     config: Config,
     manifest: Manifest,
     /// High-water mark for the highest [SegmentIndex] whose manifest update has
-    /// been confirmed durable for a *sealed* (no longer active) segment.
+    /// been confirmed durable for a *sealed* (no longer active) segment, or
+    /// `None` until the first segment is sealed durably.
     ///
-    /// Encoded as `index + 1` so that `0` can represent "no sealed segment yet";
-    /// see [Partition::sealed_ix]. Monotonically non-decreasing: retention
-    /// removing segments never moves it backward.
-    sealed_ix: Arc<AtomicU64>,
+    /// Monotonically non-decreasing: retention removing segments never moves it
+    /// backward, and the currently active (writeable) segment is never included.
+    sealed_ix: watch::Receiver<Option<SegmentIndex>>,
 }
 
 impl std::fmt::Debug for Partition {
@@ -113,17 +111,22 @@ impl Partition {
         let (commit_writer, commits) = watch::channel(record);
         let commit_manifest = manifest.clone();
         let commit_id = id.clone();
-        let sealed_ix = Arc::new(AtomicU64::new(0));
-        let commit_sealed_ix = sealed_ix.clone();
+        let (sealed_tx, sealed_ix) = watch::channel(None);
         tokio::spawn(async move {
             while let Some(r) = writes.recv().await {
                 trace!("{} checkpoint: {:?}", commit_id, &r);
                 commit_manifest.update(&commit_id, &r.data).await;
                 // the manifest update above is now durable. if it sealed the
-                // segment, advance the watermark. fetch_max keeps it monotonic
-                // regardless of the order updates land in.
+                // segment, advance the watermark, holding it monotonic against
+                // any out-of-order update.
                 if r.sealed {
-                    commit_sealed_ix.fetch_max(r.data.index.0 as u64 + 1, AtomicOrdering::Relaxed);
+                    sealed_tx.send_if_modified(|current| match current {
+                        Some(ix) if *ix >= r.data.index => false,
+                        _ => {
+                            *current = Some(r.data.index);
+                            true
+                        }
+                    });
                 }
                 // ok if no receivers, that means nothing is awaiting a commit
                 commit_writer.send(r.data.records.end).ok();
@@ -197,10 +200,7 @@ impl Partition {
     /// segment is never included. Cheap to call; intended to be read once per
     /// reconcile pass per partition.
     pub fn sealed_ix(&self) -> Option<SegmentIndex> {
-        match self.sealed_ix.load(AtomicOrdering::Relaxed) {
-            0 => None,
-            encoded => Some(SegmentIndex((encoded - 1) as usize)),
-        }
+        *self.sealed_ix.borrow()
     }
 
     pub(crate) fn slog_name(id: &PartitionId) -> String {
