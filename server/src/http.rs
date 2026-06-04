@@ -567,9 +567,6 @@ async fn get_info(
             manifest_size: a.manifest_size,
             disk_size: a.disk_size,
             delta: a.delta,
-            last_manifest_update_age_secs: a
-                .last_manifest_update_age
-                .map(|d| d.as_secs_f64()),
         })
         .collect();
 

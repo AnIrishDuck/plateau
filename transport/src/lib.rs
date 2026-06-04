@@ -492,9 +492,6 @@ pub struct ActiveSegmentReport {
     pub manifest_size: usize,
     pub disk_size: usize,
     pub delta: i64,
-    /// Seconds since this partition's most recent manifest update landed
-    /// durably, if known. Currently always `None` (no write-path hook yet).
-    pub last_manifest_update_age_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
