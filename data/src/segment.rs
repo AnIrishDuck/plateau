@@ -35,6 +35,23 @@ mod cache;
 
 const PLATEAU_HEADER: &str = "plateau1";
 
+/// Remove a file, tolerating the case where it has already been removed.
+///
+/// Retention and (eventually) reconciliation can both delete the same segment
+/// file, so the loser of that race finds it already gone. A missing file is
+/// logged at `warn` and treated as success; every other error (permissions,
+/// I/O, ...) propagates.
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("attempted to remove missing file {:?}", path);
+            Ok(())
+        }
+        Err(e) => Err(anyhow::Error::new(e).context(format!("removing {path:?}"))),
+    }
+}
+
 fn validate_header(mut reader: impl Read) -> Result<()> {
     let mut buffer = [0u8; 8];
     reader.read_exact(&mut buffer)?;
@@ -120,20 +137,20 @@ impl Segment {
     }
 
     pub fn destroy(&self) -> Result<()> {
-        if self.path.exists() {
-            fs::remove_file(&self.path)?;
-        } else {
-            warn!("main segment file at {:?} missing", self.path);
-        }
+        // The main segment file is expected to exist; a missing one is worth a
+        // warning (e.g. a concurrent remover beat us to it) but not an error.
+        remove_file_if_present(&self.path)?;
 
+        // Parts and the active-chunk cache are auxiliary and routinely absent,
+        // so only attempt the ones present. Routing through the tolerant helper
+        // still lets a remove that loses a race no-op while propagating any
+        // genuine I/O error (previously these were swallowed).
         for part in self.parts().filter(|p| p.exists()) {
-            fs::remove_file(&part)
-                .inspect_err(|e| error!("error removing part {part:?}: {e:?}"))
-                .ok();
+            remove_file_if_present(&part)?;
         }
 
         if self.cache_path().exists() {
-            fs::remove_file(self.cache_path())?;
+            remove_file_if_present(&self.cache_path())?;
         }
 
         Ok(())

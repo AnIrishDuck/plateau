@@ -71,8 +71,11 @@ impl ActiveChunk {
     }
 
     pub fn destroy(&mut self) -> Result<()> {
+        // The active-chunk cache is routinely absent (it is discarded as chunks
+        // fill), so only attempt to remove it when present. The tolerant helper
+        // still no-ops on a lost race and propagates any genuine I/O error.
         if Path::exists(&self.path) {
-            fs::remove_file(&self.path)?;
+            super::remove_file_if_present(&self.path)?;
         }
         self.writer = None;
 
