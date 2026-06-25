@@ -95,69 +95,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build-multi-arm64:
-    runs-on:
-      - buildjet-4vcpu-ubuntu-2204-arm
-    steps:
-      - name: Prepare
-        run: |
-          echo "PLATFORM_ARCH=$(arch)" >> $GITHUB_ENV
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY_IMAGE }}
-          labels: |
-            org.opencontainers.image.vendor="Wallaroo Labs"
-            org.opencontainers.image.source="https://github.com/WallarooLabs/plateau/Dockerfile"
-            org.opencontainers.image.title="plateau"
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to ghcr.io
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.PUSH_CONTAINER_TOKEN }}
-
-      - name: Login to us-docker.pkg.dev/wallaroo-dev-253816/docker-hub-us
-        uses: docker/login-action@v3
-        with:
-          registry: us-docker.pkg.dev
-          username: _json_key
-          password: ${{ secrets.US_PKG_DEV_CACHE_JSON_KEY }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          build-args: |
-            RUST_VERSION=${{ env.RUST_VERSION }}
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ env.PLATFORM_ARCH }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
   merge:
     runs-on: ubuntu-latest
     needs:
       - build-multi-amd64
-      - build-multi-arm64
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
