@@ -111,7 +111,11 @@ impl Partition {
         let (commit_writer, commits) = watch::channel(record);
         let commit_manifest = manifest.clone();
         let commit_id = id.clone();
-        let (sealed_tx, sealed_ix) = watch::channel(None);
+        // All manifest segments up to and including the max are sealed on
+        // attach: find_starting_index always starts the new active segment at
+        // max+1, so the previous max is definitionally closed.
+        let initial_sealed = segment.prev();
+        let (sealed_tx, sealed_ix) = watch::channel(initial_sealed);
         tokio::spawn(async move {
             while let Some(r) = writes.recv().await {
                 trace!("{} checkpoint: {:?}", commit_id, &r);
