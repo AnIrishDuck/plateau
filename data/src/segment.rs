@@ -221,14 +221,15 @@ impl Segment {
     }
 
     /// Return an estimate of the on-disk size of the corresponding file(s),
-    /// excluding the active chunk cache.
+    /// including the active chunk cache if present.
     pub fn size_estimate(&self) -> Result<usize> {
         let main_size = fs::metadata(&self.path).map(|p| p.len()).unwrap_or(0);
         let part_size: u64 = self
             .parts()
             .map(|part| fs::metadata(part).map(|p| p.len()).unwrap_or(0))
             .sum();
-        Ok(usize::try_from(main_size + part_size)?)
+        let cache_size = fs::metadata(self.cache_path()).map(|p| p.len()).unwrap_or(0);
+        Ok(usize::try_from(main_size + part_size + cache_size)?)
     }
 }
 
@@ -373,9 +374,7 @@ impl Writer {
 
     /// Return an estimate of the on-disk size of the corresponding file(s).
     pub fn size_estimate(&self) -> Result<usize> {
-        let segment_size = self.segment.size_estimate()?;
-        let cache_size = self.cache.size() as usize;
-        Ok(segment_size + cache_size)
+        self.segment.size_estimate()
     }
 
     pub fn close(self) -> Result<usize> {

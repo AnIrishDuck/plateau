@@ -2805,6 +2805,7 @@ dependencies = [
  "config",
  "futures",
  "humantime-serde",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "plateau-client",
