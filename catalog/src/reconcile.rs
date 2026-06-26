@@ -1002,15 +1002,13 @@ impl ReconcileJob {
         {
             if part_path.exists() {
                 tracked_files.insert(part_path.clone());
-                if part_path != segment_file.cache_path() {
-                    match fs::metadata(&part_path).await {
-                        Ok(metadata) => {
-                            total_actual_size += metadata.len() as usize;
-                            debug!("Part {:?} size: {}", part_path, metadata.len());
-                        }
-                        Err(e) => {
-                            warn!("Error getting metadata for part {:?}: {:?}", part_path, e);
-                        }
+                match fs::metadata(&part_path).await {
+                    Ok(metadata) => {
+                        total_actual_size += metadata.len() as usize;
+                        debug!("Part {:?} size: {}", part_path, metadata.len());
+                    }
+                    Err(e) => {
+                        warn!("Error getting metadata for part {:?}: {:?}", part_path, e);
                     }
                 }
             } else {
