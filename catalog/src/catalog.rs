@@ -272,6 +272,18 @@ impl Catalog {
     /// in-memory list. Only once back under the retention limit does it apply
     /// the deferred manifest deletes, which can now afford their journal space.
     pub async fn retain_startup(&self) {
+        self.retain_startup_paged(Self::STARTUP_RETENTION_PAGE_SIZE)
+            .await
+    }
+
+    /// Number of segments to read from the manifest per page during startup
+    /// retention. Bounds the working set so a catalog with a very large number
+    /// of segments is not loaded into memory all at once.
+    const STARTUP_RETENTION_PAGE_SIZE: usize = 1024;
+
+    async fn retain_startup_paged(&self, page_size: usize) {
+        assert!(page_size > 0, "startup retention page size must be positive");
+
         let limit = self.total_byte_limit();
         let mut size = self.byte_size().await;
         if size <= limit {
@@ -284,36 +296,46 @@ impl Catalog {
             "startup retention: over limit, reclaiming segment data before manifest writes"
         );
 
-        // The full eviction order (oldest first). We cannot re-query for "the
-        // oldest" each iteration the way `retain` does, because we intentionally
-        // leave the manifest untouched until the end: it would keep returning
-        // the same still-present entry.
-        let segments = self.manifest.get_segments_by_age().await;
+        // Walk the eviction order (oldest first) one page at a time. We cannot
+        // re-query for "the oldest" each iteration the way `retain` does,
+        // because we intentionally leave the manifest untouched until the end:
+        // it would keep returning the same still-present entry. The manifest is
+        // stable for the duration of the pass, so paging by `OFFSET` neither
+        // skips nor repeats a row.
         let mut removed: Vec<SegmentId<PartitionId>> = Vec::new();
-
-        for (id, segment_bytes) in segments {
-            if size <= limit {
+        let mut offset = 0;
+        'paging: loop {
+            let page = self.manifest.get_segments_by_age(page_size, offset).await;
+            if page.is_empty() {
                 break;
             }
+            offset += page.len();
 
-            // Delete the backing data directly, without opening the partition:
-            // attaching a partition spawns writer threads and can itself issue
-            // manifest writes (e.g. discarding a corrupt tail segment), which is
-            // exactly what we must avoid while the disk is full.
-            let partition_root = Topic::partition_root(&self.topic_root, id.topic());
-            let slog_name = Partition::slog_name(&id.partition_id);
-            let segment = Slog::segment_from_name(&partition_root, &slog_name, id.segment);
-            match segment.destroy() {
-                Ok(()) => {
-                    info!("startup retention: destroyed data for {} {:?}", id, id.segment);
-                    size = ByteSize::b(size.as_u64().saturating_sub(segment_bytes as u64));
-                    removed.push(id);
+            for (id, segment_bytes) in page {
+                if size <= limit {
+                    break 'paging;
                 }
-                Err(e) => {
-                    error!(
-                        "startup retention: error destroying {} {:?}: {e:?}",
-                        id, id.segment
-                    );
+
+                // Delete the backing data directly, without opening the
+                // partition: attaching a partition spawns writer threads and can
+                // itself issue manifest writes (e.g. discarding a corrupt tail
+                // segment), which is exactly what we must avoid while the disk is
+                // full.
+                let partition_root = Topic::partition_root(&self.topic_root, id.topic());
+                let slog_name = Partition::slog_name(&id.partition_id);
+                let segment = Slog::segment_from_name(&partition_root, &slog_name, id.segment);
+                match segment.destroy() {
+                    Ok(()) => {
+                        info!("startup retention: destroyed data for {} {:?}", id, id.segment);
+                        size = ByteSize::b(size.as_u64().saturating_sub(segment_bytes as u64));
+                        removed.push(id);
+                    }
+                    Err(e) => {
+                        error!(
+                            "startup retention: error destroying {} {:?}: {e:?}",
+                            id, id.segment
+                        );
+                    }
                 }
             }
         }
@@ -802,6 +824,86 @@ mod test {
         let topic = catalog.get_topic("oldest").await;
         let partition = topic.get_partition("default").await;
         assert!(partition.byte_size().await < old_size);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_retain_startup_paging() -> Result<()> {
+        let (_root, mut catalog) = catalog().await;
+        catalog.config.headroom = ByteSize::b(0);
+
+        // Large records so one segment dwarfs the few KB of WAL growth the
+        // deferred manifest deletes add; otherwise that growth could nudge the
+        // final size back over a tightly-set limit.
+        let data = "x".to_string().repeat(2000);
+        let oldest_records = build_records((0..20).map(|_| (0, data.clone())));
+
+        // Build a single sealed segment first so we can size the retention limit
+        // relative to one segment, then accumulate many more. All are stamped at
+        // time 0 so they sort first in the eviction order.
+        let segments = 10;
+        let one_segment = {
+            let topic = catalog.get_topic("oldest").await;
+            let p = topic.get_partition("default").await;
+            p.extend_records(&oldest_records).await?;
+            p.compact().await;
+            let one_segment = p.byte_size().await;
+            for _ in 1..segments {
+                p.extend_records(&oldest_records).await?;
+                p.compact().await;
+            }
+            one_segment
+        };
+
+        // A newer topic, stamped later, so it is evicted last (if at all).
+        {
+            let newer_records = build_records((0..20).map(|_| (100, data.clone())));
+            let topic = catalog.get_topic("newer").await;
+            let p = topic.get_partition("default").await;
+            p.extend_records(&newer_records).await?;
+            p.compact().await;
+        }
+
+        // Keep room for ~4.5 segments out of 11. The half-segment offset puts
+        // the limit between segment boundaries, so eviction stops comfortably
+        // below it (rather than exactly on it), and the pass must still evict
+        // far more than fit in a single (deliberately tiny) page.
+        catalog.config.retain.max_bytes =
+            ByteSize::b(catalog.manifest.db_bytes() as u64 + one_segment as u64 * 9 / 2);
+
+        let before = catalog
+            .manifest
+            .get_segments_by_age(1_000_000, 0)
+            .await
+            .len();
+        assert!(before > segments);
+        assert!(catalog.byte_size().await > catalog.total_byte_limit());
+
+        let page_size = 2;
+        catalog.retain_startup_paged(page_size).await;
+
+        // We end up under the limit, exactly as the unpaged path would.
+        assert!(catalog.byte_size().await < catalog.total_byte_limit());
+
+        // Crucially, more segments were evicted than fit in one page, proving
+        // the pass advanced across page boundaries rather than stopping after
+        // the first page.
+        let after = catalog
+            .manifest
+            .get_segments_by_age(1_000_000, 0)
+            .await
+            .len();
+        let removed = before - after;
+        assert!(
+            removed > page_size,
+            "expected to evict more than one page ({page_size}); removed {removed} of {before}"
+        );
+
+        // Eviction is oldest-first, so the newer topic still has its data.
+        let newer = catalog.get_topic("newer").await;
+        let newer_partition = newer.get_partition("default").await;
+        assert!(newer_partition.byte_size().await > 0);
 
         Ok(())
     }

@@ -388,21 +388,30 @@ impl Manifest {
             .unwrap()
     }
 
-    /// Fetch every segment ordered oldest-first (by start time), paired with
-    /// its stored byte size.
+    /// Fetch a single page of segments ordered oldest-first (by start time),
+    /// each paired with its stored byte size.
     ///
     /// Unlike [Self::get_oldest_segment], which returns only the single oldest
-    /// segment, this returns the full eviction order in one query. Startup
-    /// retention needs this because it removes backing data without mutating
-    /// the manifest mid-pass, so re-querying for "the oldest" would keep
-    /// returning the same (still-present) entry.
-    pub async fn get_segments_by_age(&self) -> Vec<(SegmentId<PartitionId>, usize)> {
+    /// segment, this walks the eviction order, but in bounded `limit`-sized
+    /// pages rather than loading every segment into memory at once. Startup
+    /// retention pages through this: it removes backing data without mutating
+    /// the manifest mid-pass, so the ordering is stable across pages and
+    /// `OFFSET` never skips or repeats a row (and re-querying for "the oldest"
+    /// would otherwise keep returning the same still-present entry).
+    pub async fn get_segments_by_age(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(SegmentId<PartitionId>, usize)> {
         sqlx::query(
             "
             SELECT topic, partition, segment_index, size FROM segments
             ORDER BY time_start ASC
+            LIMIT ?1 OFFSET ?2
         ",
         )
+        .bind(i64::try_from(limit).unwrap())
+        .bind(i64::try_from(offset).unwrap())
         .map(|row: SqliteRow| {
             let id = SegmentId::from_row(&row);
             let size = usize::try_from(row.get::<i64, _>("size")).unwrap();
