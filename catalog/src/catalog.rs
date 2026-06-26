@@ -76,7 +76,15 @@ impl CatalogRetention {
                 // monitor's min_available threshold.
                 let used = stat.total.0.saturating_sub(stat.free.0);
                 let mount_size = ByteSize(stat.avail.0.saturating_add(used));
-                info!(?root, %mount_size, "resolved size for retention");
+                info!(
+                    ?root,
+                    total = %stat.total,
+                    free = %stat.free,
+                    avail = %stat.avail,
+                    %used,
+                    %mount_size,
+                    "resolved size for retention"
+                );
 
                 Ok(Retention {
                     max_bytes: mount_size,
