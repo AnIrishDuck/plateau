@@ -388,6 +388,31 @@ impl Manifest {
             .unwrap()
     }
 
+    /// Fetch every segment ordered oldest-first (by start time), paired with
+    /// its stored byte size.
+    ///
+    /// Unlike [Self::get_oldest_segment], which returns only the single oldest
+    /// segment, this returns the full eviction order in one query. Startup
+    /// retention needs this because it removes backing data without mutating
+    /// the manifest mid-pass, so re-querying for "the oldest" would keep
+    /// returning the same (still-present) entry.
+    pub async fn get_segments_by_age(&self) -> Vec<(SegmentId<PartitionId>, usize)> {
+        sqlx::query(
+            "
+            SELECT topic, partition, segment_index, size FROM segments
+            ORDER BY time_start ASC
+        ",
+        )
+        .map(|row: SqliteRow| {
+            let id = SegmentId::from_row(&row);
+            let size = usize::try_from(row.get::<i64, _>("size")).unwrap();
+            (id, size)
+        })
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// Find the segment with the highest index for a given partition.
     pub async fn get_max_segment(&self, id: &PartitionId) -> Option<SegmentIndex> {
         self.get_ordered_segment(id, &Ordering::Reverse).await

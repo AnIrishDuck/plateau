@@ -22,8 +22,10 @@ use tracing::{debug, error, info, trace, warn};
 use crate::data::limit::Retention;
 use crate::manifest::Manifest;
 use crate::manifest::Scope;
-use crate::partition;
+use crate::manifest::{PartitionId, SegmentId};
+use crate::partition::{self, Partition};
 use crate::reconcile::ReconcileReport;
+use crate::slog::Slog;
 use crate::storage::{self, DiskMonitor};
 use crate::topic::Topic;
 
@@ -251,6 +253,93 @@ impl Catalog {
             partition.remove_oldest().await;
         }
         trace!("end global retention check");
+    }
+
+    /// Special retention pass intended to run exactly once at startup, before
+    /// the checkpoint and retention main loops begin.
+    ///
+    /// Normal retention ([Self::retain]) is concurrency-safe: for each evicted
+    /// segment it removes the manifest entry *before* deleting the backing data,
+    /// so a concurrent reader never sees a manifest entry pointing at missing
+    /// data. That ordering requires a manifest write (a SQLite `DELETE`) per
+    /// segment, and a SQLite write needs free disk for its journal/WAL. When the
+    /// disk is completely full that write fails (`database or disk is full`) and
+    /// the process can never reclaim enough space to start.
+    ///
+    /// This pass inverts the ordering. There are no concurrent readers yet, so
+    /// it is safe to delete the backing data for the oldest segments *first* —
+    /// which is what actually frees disk — recording each removal in an
+    /// in-memory list. Only once back under the retention limit does it apply
+    /// the deferred manifest deletes, which can now afford their journal space.
+    pub async fn retain_startup(&self) {
+        let limit = self.total_byte_limit();
+        let mut size = self.byte_size().await;
+        if size <= limit {
+            debug!(?limit, %size, "startup retention: under limit, nothing to do");
+            return;
+        }
+
+        info!(
+            ?limit, %size,
+            "startup retention: over limit, reclaiming segment data before manifest writes"
+        );
+
+        // The full eviction order (oldest first). We cannot re-query for "the
+        // oldest" each iteration the way `retain` does, because we intentionally
+        // leave the manifest untouched until the end: it would keep returning
+        // the same still-present entry.
+        let segments = self.manifest.get_segments_by_age().await;
+        let mut removed: Vec<SegmentId<PartitionId>> = Vec::new();
+
+        for (id, segment_bytes) in segments {
+            if size <= limit {
+                break;
+            }
+
+            // Delete the backing data directly, without opening the partition:
+            // attaching a partition spawns writer threads and can itself issue
+            // manifest writes (e.g. discarding a corrupt tail segment), which is
+            // exactly what we must avoid while the disk is full.
+            let partition_root = Topic::partition_root(&self.topic_root, id.topic());
+            let slog_name = Partition::slog_name(&id.partition_id);
+            let segment = Slog::segment_from_name(&partition_root, &slog_name, id.segment);
+            match segment.destroy() {
+                Ok(()) => {
+                    info!("startup retention: destroyed data for {} {:?}", id, id.segment);
+                    size = ByteSize::b(size.as_u64().saturating_sub(segment_bytes as u64));
+                    removed.push(id);
+                }
+                Err(e) => {
+                    error!(
+                        "startup retention: error destroying {} {:?}: {e:?}",
+                        id, id.segment
+                    );
+                }
+            }
+        }
+
+        info!(
+            removed = removed.len(),
+            "startup retention: data reclaimed, applying deferred manifest deletes"
+        );
+
+        // Disk now has headroom (freeing even one segment is enough for the
+        // SQLite journal), so flush the manifest removals we deferred above.
+        for id in &removed {
+            self.manifest
+                .remove_segment(id.segment.to_id(&id.partition_id))
+                .await;
+        }
+
+        let final_size = self.byte_size().await;
+        if final_size > limit {
+            warn!(
+                ?limit, %final_size,
+                "startup retention: still over limit after reclaiming all eligible segments"
+            );
+        } else {
+            info!(?limit, %final_size, "startup retention complete");
+        }
     }
 
     #[tracing::instrument(skip_all, level = "debug")]
@@ -663,6 +752,52 @@ mod test {
 
         assert!(catalog.byte_size().await > catalog.total_byte_limit());
         catalog.retain().await;
+        assert!(catalog.byte_size().await < catalog.total_byte_limit());
+        let topic = catalog.get_topic("oldest").await;
+        let partition = topic.get_partition("default").await;
+        assert!(partition.byte_size().await < old_size);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_retain_startup() -> Result<()> {
+        let (_root, mut catalog) = catalog().await;
+        catalog.config.retain.max_bytes = ByteSize::b(8000 + catalog.manifest.db_bytes() as u64);
+        catalog.config.headroom = ByteSize::b(0);
+
+        let data = "x".to_string().repeat(500);
+
+        let old_size = {
+            let oldest_records = build_records((0..10).map(|_| (0, data.clone())));
+            let oldest_topic = catalog.get_topic("oldest").await;
+            let p = oldest_topic.get_partition("default").await;
+
+            p.extend_records(&oldest_records).await?;
+            p.compact().await;
+            p.extend_records(&oldest_records).await?;
+            p.compact().await;
+            p.extend_records(&oldest_records).await?;
+            p.byte_size().await
+        };
+
+        let records = build_records((0..10).map(|_| (100, data.clone())));
+        for ix in 0..5 {
+            let name = format!("topic-{ix}");
+            let topic = catalog.get_topic(&name).await;
+            let partition = topic.get_partition("default").await;
+            partition.extend_records(&records).await?;
+            partition.compact().await;
+            partition.extend_records(&records).await?;
+        }
+
+        assert!(catalog.byte_size().await > catalog.total_byte_limit());
+
+        catalog.retain_startup().await;
+
+        // Both the manifest accounting and the eviction-by-age policy match
+        // normal retention: we end up under the limit and the oldest topic has
+        // shed data.
         assert!(catalog.byte_size().await < catalog.total_byte_limit());
         let topic = catalog.get_topic("oldest").await;
         let partition = topic.get_partition("default").await;

@@ -63,6 +63,13 @@ pub async fn task_from_config(
             .expect("error opening catalog"),
     );
 
+    // Reclaim disk before any of the main loops start. Normal retention writes
+    // to the manifest before deleting backing data, which cannot make progress
+    // when the disk is already full; this startup pass deletes data first so the
+    // subsequent manifest writes have room. Must run before the catalog and
+    // retention loops below.
+    catalog.retain_startup().await;
+
     task_from_catalog_config(catalog, config, stop).await
 }
 
