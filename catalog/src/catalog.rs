@@ -41,6 +41,8 @@ pub struct Config {
     #[serde(default = "Catalog::default_max_open_topics")]
     pub max_open_topics: usize,
     pub max_partition_bytes: ByteSize,
+    #[serde(default = "Catalog::default_max_active_partitions")]
+    pub max_active_partitions: usize,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             storage: Default::default(),
             max_open_topics: Catalog::default_max_open_topics(),
             max_partition_bytes: ByteSize::mib(3500),
+            max_active_partitions: Catalog::default_max_active_partitions(),
         }
     }
 }
@@ -290,18 +293,22 @@ impl Catalog {
         }
 
         let mut bytes = 0;
+        // Keyed on (end time, topic, partition) so partitions that share an end
+        // time stay distinct entries rather than colliding (which would hide
+        // them from both the byte and active-count limits below).
         let mut ages = BTreeMap::default();
         for (topic_name, topic) in topics.iter() {
             for (partition_name, data) in topic.active_data().await {
-                ages.insert(*data.time.end(), (topic_name.clone(), partition_name));
+                ages.insert((*data.time.end(), topic_name.clone(), partition_name), ());
                 bytes += data.size;
             }
         }
 
         let max_bytes = self.config.max_partition_bytes.as_u64() as usize;
-        trace!(bytes, max_bytes);
-        while bytes > max_bytes {
-            let Some((time, (topic_name, partition_name))) = ages.pop_first() else {
+        let max_active = self.config.max_active_partitions;
+        trace!(bytes, max_bytes, active = ages.len(), max_active);
+        while bytes > max_bytes || ages.len() > max_active {
+            let Some(((time, topic_name, partition_name), ())) = ages.pop_first() else {
                 error!("ran out of topics while trying to prune");
                 return;
             };
@@ -313,7 +320,11 @@ impl Catalog {
             };
 
             let age = Utc::now().signed_duration_since(time).to_std();
-            info!("closing {topic_name}/{partition_name} (age {age:?}, {bytes} > {max_bytes})");
+            info!(
+                "closing {topic_name}/{partition_name} (age {age:?}, {bytes} > {max_bytes} bytes, \
+                 {} > {max_active} active)",
+                ages.len() + 1
+            );
             let Some(data) = topic.close_partition(&partition_name).await else {
                 error!("invalid partition {partition_name}");
                 continue;
@@ -425,6 +436,12 @@ impl Catalog {
     /// Default number of topics to keep in-memory.
     pub fn default_max_open_topics() -> usize {
         128
+    }
+
+    /// Default number of active (in-memory, writable) partitions to keep open
+    /// across the catalog.
+    pub fn default_max_active_partitions() -> usize {
+        4096
     }
 
     pub async fn close(self) {
@@ -787,6 +804,47 @@ mod test {
             // comes back but does not invoke the byte limit
             assert_eq!(catalog.active_partitions().await, 2);
         }
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_partition_active_count_limit() -> Result<()> {
+        // High byte limit so only the count limit is exercised.
+        let (_root, catalog) = catalog_config(Config {
+            max_active_partitions: 2,
+            ..Default::default()
+        })
+        .await;
+
+        let time = Utc::now()
+            .checked_sub_signed(TimeDelta::try_seconds(10).unwrap())
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap();
+
+        let record = Record {
+            time,
+            message: "hello".bytes().collect(),
+        };
+
+        // Three distinct topics, each with one active partition.
+        for ix in 0..3 {
+            let name = format!("topic-{ix}");
+            let topic = catalog.get_topic(&name).await;
+            let insert = topic
+                .extend_records("default", slice::from_ref(&record))
+                .await?;
+            topic
+                .ensure_index("default", RecordIndex(insert.end.0 - 1))
+                .await?;
+        }
+
+        assert_eq!(catalog.active_partitions().await, 3);
+
+        // Pruning closes the oldest active partition down to the count limit.
+        catalog.prune_topics().await;
+        assert_eq!(catalog.active_partitions().await, 2);
 
         Ok(())
     }
