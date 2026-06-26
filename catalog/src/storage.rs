@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytesize::ByteSize;
-use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
-use systemstat::{Platform, System};
+use libc;
+use serde::{Deserialize, Serialize};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::info;
@@ -18,11 +18,40 @@ const MAX_WRITES: usize = 10_000;
 const MAX_DURATION: Duration = Duration::from_secs(10);
 const MIN_AVAILABLE: ByteSize = ByteSize::gb(1);
 
-pub(crate) async fn path_mount_stat(path: PathBuf) -> anyhow::Result<systemstat::Filesystem> {
-    let stat = System::new();
+/// Filesystem size statistics for a mount point.
+pub(crate) struct MountStat {
+    /// Total capacity (f_blocks * f_frsize).
+    pub total: ByteSize,
+    /// Free blocks including root-reserved (f_bfree * f_frsize).
+    pub free: ByteSize,
+    /// Free blocks available to unprivileged users (f_bavail * f_frsize).
+    pub avail: ByteSize,
+}
+
+/// Call `statvfs(2)` on the mount containing `path` and return size fields.
+///
+/// Uses `f_frsize` (the fundamental block size that `f_blocks`/`f_bfree`/
+/// `f_bavail` are counted in) rather than `f_bsize` (preferred I/O size).
+/// On some filesystems these differ, causing `f_blocks * f_bsize` to
+/// overcount by a factor of `f_bsize / f_frsize`.
+#[cfg(not(test))]
+pub(crate) async fn path_mount_stat(path: PathBuf) -> anyhow::Result<MountStat> {
     spawn_blocking(move || {
-        let fs = stat.mount_at(path)?;
-        Ok::<_, anyhow::Error>(fs)
+        use std::ffi::CString;
+        let cpath = CString::new(path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("path contains invalid UTF-8")
+        })?)?;
+        let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut info) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let frsize = info.f_frsize;
+        Ok(MountStat {
+            total: ByteSize::b(info.f_blocks * frsize),
+            free:  ByteSize::b(info.f_bfree  * frsize),
+            avail: ByteSize::b(info.f_bavail  * frsize),
+        })
     })
     .await?
 }
@@ -167,38 +196,19 @@ impl Default for Config {
     }
 }
 
+/// Test stub: parses avail bytes from the last path component (numeric suffix).
 #[cfg(test)]
-struct System;
-
-#[cfg(test)]
-impl System {
-    fn new() -> Self {
-        Self
-    }
-
-    /// Parses a free space value from the supplied path, and if found includes it
-    /// in a mock fs stats struct
-    fn mount_at(&self, path: impl AsRef<Path>) -> std::io::Result<systemstat::Filesystem> {
-        let mut fs = systemstat::Filesystem {
-            files: Default::default(),
-            files_total: Default::default(),
-            files_avail: Default::default(),
-            free: Default::default(),
-            avail: Default::default(),
-            total: Default::default(),
-            name_max: Default::default(),
-            fs_type: Default::default(),
-            fs_mounted_from: Default::default(),
-            fs_mounted_on: Default::default(),
-        };
-
-        let suffix = path.as_ref().file_name().unwrap_or_default();
-        if let Some(avail) = suffix.to_str().and_then(|path| path.parse::<u64>().ok()) {
-            fs.avail = ByteSize::b(avail);
-        }
-
-        Ok(fs)
-    }
+pub(crate) async fn path_mount_stat(path: PathBuf) -> anyhow::Result<MountStat> {
+    let avail = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok(MountStat {
+        total: ByteSize::b(avail),
+        free: ByteSize::b(avail),
+        avail: ByteSize::b(avail),
+    })
 }
 
 #[cfg(test)]
