@@ -15,6 +15,7 @@ use crate::manifest::{Manifest, PartitionId, Scope, SegmentData};
 
 use crate::partition::Config as PartitionConfig;
 use crate::partition::Partition;
+use crate::slog::SegmentIndex;
 
 use crate::data::index::{Ordering, RecordIndex};
 use crate::transport::{PartitionFilter, PartitionSelector, SchemaChunk, TopicIterator};
@@ -140,6 +141,22 @@ impl Topic {
             })
             .collect()
             .await
+    }
+
+    /// Read a partition's `sealed_ix` watermark *without* loading it into
+    /// memory. Returns `None` when the partition is not currently resident
+    /// (so reconcile can treat its on-disk segments as immutable rather than
+    /// forcing a load, which would reset the in-memory watermark to `None`),
+    /// or `Some(watermark)` when resident.
+    pub(crate) async fn resident_sealed_ix(
+        &self,
+        partition_name: &str,
+    ) -> Option<Option<SegmentIndex>> {
+        self.partitions
+            .read()
+            .await
+            .get(partition_name)
+            .map(|partition| partition.sealed_ix())
     }
 
     pub async fn get_partition(&self, partition_name: &str) -> RwLockReadGuard<'_, Partition> {

@@ -33,13 +33,30 @@ use crate::partition::Partition;
 use crate::slog::Slog;
 use crate::topic::Topic;
 
-/// Whether a segment is sealed relative to a partition's `sealed_ix` watermark.
+/// How a partition's segments are classified during a reconcile pass.
+enum SealStatus {
+    /// The partition is resident in memory. Segments at or below the
+    /// `sealed_ix` watermark are durably sealed; anything above it is the live
+    /// active tail. A `None` watermark means no segment has sealed durably yet,
+    /// so every segment is the active tail.
+    Resident(Option<SegmentIndex>),
+    /// The partition is not resident in memory. No writer can extend any of its
+    /// segments, and a reopen would begin a fresh segment, so every persisted
+    /// segment is immutable — treat them all as sealed.
+    Quiescent,
+}
+
+/// Whether a segment is sealed (immutable on disk) for this pass.
 ///
-/// A segment is sealed only when the partition has a watermark (`Some`) and the
-/// segment index is at or below it. When the watermark is `None` (no segment has
-/// sealed durably yet) every segment is treated as active.
-fn is_sealed(sealed_ix: Option<SegmentIndex>, index: SegmentIndex) -> bool {
-    sealed_ix.is_some_and(|watermark| index <= watermark)
+/// A non-resident partition is quiescent, so all of its segments are sealed.
+/// A resident partition is sealed only at or below its `sealed_ix` watermark;
+/// the live active tail above it (or every segment, when the watermark is
+/// `None`) is treated as active.
+fn is_sealed(status: &SealStatus, index: SegmentIndex) -> bool {
+    match status {
+        SealStatus::Quiescent => true,
+        SealStatus::Resident(watermark) => watermark.is_some_and(|w| index <= w),
+    }
 }
 
 /// Parse the partition name and segment index out of a segment file *stem* of
@@ -751,16 +768,24 @@ impl ReconcileJob {
             topic_name, partition_name, topic_path
         );
 
-        // Read the sealed watermark once for this partition pass. Segments at or
-        // below it are durable and run through the strict sealed-diff pipeline;
-        // anything above it (or every segment, if the partition has not sealed
-        // one yet) is the currently active tail and goes to the informational
-        // active bucket instead. The watermark never moves backward, so this
-        // single read is a stable basis for the whole pass.
-        let sealed_ix = {
-            let topic = self.catalog.get_topic(topic_name).await;
-            let partition = topic.get_partition(partition_name).await;
-            partition.sealed_ix()
+        // Classify this partition's segments once for the whole pass, *without*
+        // loading it into memory. A partition that is not resident is quiescent:
+        // no writer can extend its tail, and a reopen would start a brand-new
+        // segment, so every persisted segment is immutable and runs through the
+        // strict sealed-diff pipeline. (Force-loading it would reset the
+        // in-memory watermark to `None` and wrongly bucket every segment as
+        // active.) A resident partition keeps the conservative watermark
+        // semantics: segments at or below `sealed_ix` are durable; anything
+        // above it is the live active tail and goes to the informational active
+        // bucket instead. The watermark never moves backward, so this single
+        // read is a stable basis for the whole pass.
+        let seal_status = match self
+            .catalog
+            .resident_sealed_ix(topic_name, partition_name)
+            .await
+        {
+            Some(watermark) => SealStatus::Resident(watermark),
+            None => SealStatus::Quiescent,
         };
 
         // Create sets to track files
@@ -776,11 +801,11 @@ impl ReconcileJob {
         let segments: Vec<SegmentData> = segments_stream.collect().await;
         if let Some((start, end)) = segments.first().zip(segments.last()) {
             debug!(
-                "Fetched {} segments: {} ..= {} (sealed_ix={:?})",
+                "Fetched {} segments: {} ..= {} (resident={})",
                 segments.len(),
                 start.index.0,
                 end.index.0,
-                sealed_ix,
+                matches!(seal_status, SealStatus::Resident(_)),
             );
         } else {
             debug!("Found no segments")
@@ -800,11 +825,10 @@ impl ReconcileJob {
             // detection phase does not false-positive on active segment files.
             tracked_files.insert(segment_path.clone());
 
-            // A segment is "sealed" only when the partition has a watermark and
-            // this segment's index is at or below it. Everything else is the
-            // active tail (this includes the all-segments-active case when the
-            // partition has never sealed a segment, i.e. sealed_ix is None).
-            if is_sealed(sealed_ix, segment.index) {
+            // Sealed segments run the strict diff; the live active tail of a
+            // resident partition goes to the informational active bucket. See
+            // `SealStatus` for how non-resident partitions are handled.
+            if is_sealed(&seal_status, segment.index) {
                 self.process_sealed_segment(
                     &partition_id,
                     &segment,
@@ -1659,6 +1683,71 @@ mod tests {
         // The still-active segment shows up in the active bucket.
         let active = active_entries(report, topic_name, partition_name);
         assert_eq!(active.len(), 1);
+
+        Ok(())
+    }
+
+    /// A partition evicted from memory (as the active-partition limit does) is
+    /// quiescent: its persisted tail can never be written to again — a reopen
+    /// starts a fresh segment — so reconcile must treat that tail as sealed
+    /// rather than force-loading the partition and counting every segment as
+    /// active.
+    #[test_log::test(tokio::test)]
+    async fn test_evicted_partition_segments_are_sealed() -> Result<()> {
+        // High roll threshold: while resident the single segment stays active
+        // and unsealed (sealed_ix == None) — the case that previously inflated
+        // the active bucket once the partition was force-loaded.
+        let (_tmpdir, catalog) = create_test_catalog_rolling(1000).await;
+        let topic_name = "evicted";
+        let partition_name = "p0";
+
+        let topic = catalog.get_topic(topic_name).await;
+        topic
+            .extend_records(partition_name, &test_records(&["a", "b", "c"]))
+            .await?;
+        drop(topic);
+
+        // Persist the active segment to the manifest without sealing it.
+        catalog.checkpoint().await;
+        catalog
+            .get_topic(topic_name)
+            .await
+            .ensure_index(partition_name, RecordIndex(3))
+            .await?;
+
+        // Evict the partition from memory, exactly as the active-partition limit
+        // does. Its tail is now immutable on disk.
+        let evicted = catalog
+            .get_topic(topic_name)
+            .await
+            .close_partition(partition_name)
+            .await;
+        assert!(evicted.is_some(), "partition should have been resident");
+        assert_eq!(
+            catalog.resident_sealed_ix(topic_name, partition_name).await,
+            None,
+            "partition should no longer be resident"
+        );
+
+        let config = ReconcileConfig {
+            track_files: true,
+            ..Default::default()
+        };
+        let mut reconciler = ReconcileJob::with_config(catalog.clone(), config);
+        assert!(reconciler.run(Some(100)).await?);
+
+        let report = reconciler.report();
+        // The evicted tail must NOT be counted as active...
+        assert!(
+            active_entries(report, topic_name, partition_name).is_empty(),
+            "evicted partition's segments must not be in the active bucket"
+        );
+        // ...and reconcile must not have force-loaded the partition back in.
+        assert_eq!(
+            catalog.resident_sealed_ix(topic_name, partition_name).await,
+            None,
+            "reconcile must not force-load a non-resident partition"
+        );
 
         Ok(())
     }
