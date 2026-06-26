@@ -441,7 +441,7 @@ impl Catalog {
     /// Default number of active (in-memory, writable) partitions to keep open
     /// across the catalog.
     pub fn default_max_active_partitions() -> usize {
-        4096
+        256
     }
 
     pub async fn close(self) {
