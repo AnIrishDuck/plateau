@@ -83,7 +83,11 @@ impl Topic {
     }
 
     pub async fn byte_size(&self) -> usize {
-        self.manifest.get_size(Scope::Topic(&self.name)).await
+        // Include the in-progress size of each partition's active segment, which
+        // is not yet reflected in the manifest, so this better matches disk.
+        let stored = self.manifest.get_size(Scope::Topic(&self.name)).await;
+        let active: usize = self.active_data().await.values().map(|d| d.size).sum();
+        stored + active
     }
 
     async fn partition_names(&self) -> Vec<String> {

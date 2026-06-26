@@ -238,13 +238,14 @@ impl Catalog {
         self.gauge_topics().await;
         self.prune_topics().await;
         while self.over_retention_limit().await {
-            // errors in here are effectively unrecoverable as the loop would otherwise spin.
-            // additionally, the disk will eventually fill leading to system failure
-            let oldest = self
-                .manifest
-                .get_oldest_segment(None)
-                .await
-                .expect("no partition to remove");
+            // Only sealed segments are evictable. Once none remain, the active
+            // segments alone exceed the limit and there is nothing more we can
+            // do, so stop rather than panic/spin (the disk may still fill, but
+            // that is a capacity problem, not a bug to crash on).
+            let Some(oldest) = self.manifest.get_oldest_segment(None).await else {
+                warn!("over retention limit but no sealed segments remain to evict");
+                break;
+            };
 
             let topic = self.get_topic(oldest.topic()).await;
             let partition = topic.get_partition(oldest.partition()).await;
@@ -323,8 +324,25 @@ impl Catalog {
         }
     }
 
+    /// Sum of the in-progress sizes of every open partition's active segment.
+    /// These bytes are already on disk but not yet recorded in the manifest.
+    async fn active_byte_size(&self) -> usize {
+        let topics = &self.state.read().await.topics;
+        let mut bytes = 0;
+        for topic in topics.values() {
+            bytes += topic
+                .active_data()
+                .await
+                .values()
+                .map(|d| d.size)
+                .sum::<usize>();
+        }
+        bytes
+    }
+
     async fn byte_size(&self) -> ByteSize {
-        ByteSize::b(self.manifest.get_size(Scope::Global).await as u64)
+        let stored = self.manifest.get_size(Scope::Global).await;
+        ByteSize::b((stored + self.active_byte_size().await) as u64)
     }
 
     pub fn total_byte_limit(&self) -> ByteSize {
@@ -648,6 +666,9 @@ mod test {
             p.extend_records(&oldest_records).await?;
             p.compact().await;
             p.extend_records(&oldest_records).await?;
+            // Seal everything so this test exercises sealed-segment eviction;
+            // un-evictable active bytes are covered by the test below.
+            p.compact().await;
             p.byte_size().await
         };
 
@@ -659,6 +680,7 @@ mod test {
             partition.extend_records(&records).await?;
             partition.compact().await;
             partition.extend_records(&records).await?;
+            partition.compact().await;
         }
 
         assert!(catalog.byte_size().await > catalog.total_byte_limit());
@@ -667,6 +689,39 @@ mod test {
         let topic = catalog.get_topic("oldest").await;
         let partition = topic.get_partition("default").await;
         assert!(partition.byte_size().await < old_size);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_active_segment_counts_toward_size() -> Result<()> {
+        let (_root, catalog) = catalog().await;
+        let data = "x".to_string().repeat(500);
+        let records = build_records((0..10).map(|_| (0, data.clone())));
+
+        let topic = catalog.get_topic("t").await;
+        let partition = topic.get_partition("default").await;
+
+        let empty = partition.byte_size().await;
+
+        // Write data but do NOT compact: it lives in the active segment, so the
+        // manifest still reports nothing, yet byte_size must reflect the
+        // in-progress data so retention matches what is actually on disk.
+        partition.extend_records(&records).await?;
+        let with_active = partition.byte_size().await;
+        assert!(
+            with_active > empty,
+            "active segment bytes ({with_active}) should exceed empty ({empty})"
+        );
+
+        // The same in-progress bytes must roll up to the topic and catalog.
+        assert!(topic.byte_size().await >= with_active);
+        assert!(catalog.byte_size().await.as_u64() as usize >= with_active);
+
+        // After sealing, the size should remain accounted for (now via the
+        // manifest rather than the active segment).
+        partition.compact().await;
+        assert!(partition.byte_size().await > empty);
 
         Ok(())
     }

@@ -345,13 +345,24 @@ impl Partition {
     }
 
     pub async fn byte_size(&self) -> usize {
-        self.manifest.get_size(Scope::Partition(&self.id)).await
+        // The manifest only knows about sealed segments. The active segment is
+        // still being written and its data is already on disk (in the chunk
+        // cache) but not yet reflected in the manifest, so include its
+        // in-progress size to more closely match actual disk usage.
+        let stored = self.manifest.get_size(Scope::Partition(&self.id)).await;
+        let active = self.active_data().await.map(|d| d.size).unwrap_or(0);
+        stored + active
     }
 
-    async fn over_retention_limit(&self) -> bool {
+    /// `active_bytes` is the in-progress size of the active segment, supplied by
+    /// the caller. It is taken as a parameter rather than read here because this
+    /// is called from `State::retain` while the partition state write lock is
+    /// held; re-acquiring it via [`Self::byte_size`] would deadlock.
+    async fn over_retention_limit(&self, active_bytes: usize) -> bool {
         let retain = &self.config.retain;
 
-        let size = self.byte_size().await;
+        let stored = self.manifest.get_size(Scope::Partition(&self.id)).await;
+        let size = stored + active_bytes;
         gauge!(
             "partition_size_bytes",
             "topic" => String::from(self.id.topic()),
@@ -582,12 +593,35 @@ impl State {
     }
 
     async fn retain(&self, partition: &Partition) {
-        while partition.over_retention_limit().await {
-            self.remove_oldest(partition).await;
+        // Read the active segment size directly from the slog (its own lock)
+        // rather than through `partition.byte_size()`, which would try to
+        // re-acquire the partition state lock we already hold here.
+        loop {
+            let active_bytes = self
+                .messages
+                .active_segment_data()
+                .await
+                .map(|d| d.size)
+                .unwrap_or(0);
+            if !partition.over_retention_limit(active_bytes).await {
+                break;
+            }
+            // Only sealed segments can be removed. If nothing is left to evict,
+            // the active (in-progress) segment alone is over the limit; there's
+            // nothing more retention can do, so stop rather than spin forever.
+            if !self.remove_oldest(partition).await {
+                warn!(
+                    "{} over retention limit but no sealed segments remain to evict",
+                    partition.id
+                );
+                break;
+            }
         }
     }
 
-    async fn remove_oldest(&self, partition: &Partition) {
+    /// Evict the oldest sealed segment. Returns `false` when there was no sealed
+    /// segment to remove (i.e. only the active segment remains).
+    async fn remove_oldest(&self, partition: &Partition) -> bool {
         if let Some(ix) = partition.manifest.get_min_segment(&partition.id).await {
             // TODO ensure we handle failure if this call
             partition
@@ -603,6 +637,9 @@ impl State {
                 "partition" => String::from(partition.id.partition())
             )
             .increment(1);
+            true
+        } else {
+            false
         }
     }
 
