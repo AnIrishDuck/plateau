@@ -35,10 +35,12 @@ use crate::topic::Topic;
 
 /// How a partition's segments are classified during a reconcile pass.
 enum SealStatus {
-    /// The partition is resident in memory. Segments at or below the
-    /// `sealed_ix` watermark are durably sealed; anything above it is the live
-    /// active tail. A `None` watermark means no segment has sealed durably yet,
-    /// so every segment is the active tail.
+    /// The partition is resident in memory. The wrapped value is its in-memory
+    /// active (live writeable) segment index, if any — the only segment whose
+    /// on-disk size may legitimately run ahead of the manifest. Every other
+    /// segment is finalized and immutable. `None` means the partition has no
+    /// active segment in memory (e.g. loaded only for reads), so all of its
+    /// segments are sealed.
     Resident(Option<SegmentIndex>),
     /// The partition is not resident in memory. No writer can extend any of its
     /// segments, and a reopen would begin a fresh segment, so every persisted
@@ -48,14 +50,14 @@ enum SealStatus {
 
 /// Whether a segment is sealed (immutable on disk) for this pass.
 ///
-/// A non-resident partition is quiescent, so all of its segments are sealed.
-/// A resident partition is sealed only at or below its `sealed_ix` watermark;
-/// the live active tail above it (or every segment, when the watermark is
-/// `None`) is treated as active.
+/// A non-resident partition is quiescent, so all of its segments are sealed. A
+/// resident partition has at most one unsealed segment — its live active tail;
+/// every other segment (including the just-rolled `pending` one, which is
+/// finalized on disk) is sealed.
 fn is_sealed(status: &SealStatus, index: SegmentIndex) -> bool {
     match status {
         SealStatus::Quiescent => true,
-        SealStatus::Resident(watermark) => watermark.is_some_and(|w| index <= w),
+        SealStatus::Resident(active) => *active != Some(index),
     }
 }
 
@@ -770,21 +772,24 @@ impl ReconcileJob {
 
         // Classify this partition's segments once for the whole pass, *without*
         // loading it into memory. A partition that is not resident is quiescent:
-        // no writer can extend its tail, and a reopen would start a brand-new
+        // no writer can extend any segment, and a reopen would start a brand-new
         // segment, so every persisted segment is immutable and runs through the
-        // strict sealed-diff pipeline. (Force-loading it would reset the
-        // in-memory watermark to `None` and wrongly bucket every segment as
-        // active.) A resident partition keeps the conservative watermark
-        // semantics: segments at or below `sealed_ix` are durable; anything
-        // above it is the live active tail and goes to the informational active
-        // bucket instead. The watermark never moves backward, so this single
-        // read is a stable basis for the whole pass.
+        // strict sealed-diff pipeline. A resident partition has at most one
+        // unsealed segment — its in-memory active (live writeable) tail, whose
+        // on-disk size may legitimately run ahead of the manifest; that one goes
+        // to the informational active bucket and everything else is sealed.
+        //
+        // We key on the active segment index rather than the `sealed_ix`
+        // watermark on purpose: the watermark resets to `None` whenever a
+        // partition is (re)loaded and only re-advances on a roll, so a partition
+        // loaded for reads would otherwise have *all* of its segments bucketed
+        // as active.
         let seal_status = match self
             .catalog
-            .resident_sealed_ix(topic_name, partition_name)
+            .resident_active_ix(topic_name, partition_name)
             .await
         {
-            Some(watermark) => SealStatus::Resident(watermark),
+            Some(active) => SealStatus::Resident(active),
             None => SealStatus::Quiescent,
         };
 
@@ -1724,7 +1729,7 @@ mod tests {
             .await;
         assert!(evicted.is_some(), "partition should have been resident");
         assert_eq!(
-            catalog.resident_sealed_ix(topic_name, partition_name).await,
+            catalog.resident_active_ix(topic_name, partition_name).await,
             None,
             "partition should no longer be resident"
         );
@@ -1744,9 +1749,72 @@ mod tests {
         );
         // ...and reconcile must not have force-loaded the partition back in.
         assert_eq!(
-            catalog.resident_sealed_ix(topic_name, partition_name).await,
+            catalog.resident_active_ix(topic_name, partition_name).await,
             None,
             "reconcile must not force-load a non-resident partition"
+        );
+
+        Ok(())
+    }
+
+    /// A partition that is resident only for *reads* (e.g. brought back by a
+    /// query) has no in-memory active segment, so its `sealed_ix` watermark is
+    /// `None`. Its on-disk segments are nonetheless finalized and immutable —
+    /// reconcile must treat them all as sealed rather than bucketing every one
+    /// as active just because the watermark reset on load.
+    #[test_log::test(tokio::test)]
+    async fn test_read_loaded_partition_segments_are_sealed() -> Result<()> {
+        // Roll after 2 rows so two batches produce a sealed segment 0 and an
+        // active segment 1 — more than one segment to (mis)count.
+        let (_tmpdir, catalog) = create_test_catalog_rolling(2).await;
+        let topic_name = "read-loaded";
+        let partition_name = "p0";
+
+        let topic = catalog.get_topic(topic_name).await;
+        topic
+            .extend_records(partition_name, &test_records(&["a", "b", "c"]))
+            .await?;
+        topic
+            .extend_records(partition_name, &test_records(&["d", "e", "f"]))
+            .await?;
+        drop(topic);
+        catalog.checkpoint().await;
+        catalog
+            .get_topic(topic_name)
+            .await
+            .ensure_index(partition_name, RecordIndex(6))
+            .await?;
+        catalog.checkpoint().await;
+
+        // Evict, then bring the partition back *for reads only* (no writes), as
+        // a query would. It is resident again but has no in-memory active
+        // segment, so its watermark is None.
+        catalog
+            .get_topic(topic_name)
+            .await
+            .close_partition(partition_name)
+            .await;
+        {
+            let topic = catalog.get_topic(topic_name).await;
+            let _read = topic.get_partition(partition_name).await;
+        }
+        assert_eq!(
+            catalog.resident_active_ix(topic_name, partition_name).await,
+            Some(None),
+            "partition should be resident with no active segment"
+        );
+
+        let config = ReconcileConfig {
+            track_files: true,
+            ..Default::default()
+        };
+        let mut reconciler = ReconcileJob::with_config(catalog.clone(), config);
+        assert!(reconciler.run(Some(100)).await?);
+
+        let report = reconciler.report();
+        assert!(
+            active_entries(report, topic_name, partition_name).is_empty(),
+            "a read-loaded partition's segments must all be sealed, not active"
         );
 
         Ok(())

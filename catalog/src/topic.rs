@@ -143,20 +143,24 @@ impl Topic {
             .await
     }
 
-    /// Read a partition's `sealed_ix` watermark *without* loading it into
-    /// memory. Returns `None` when the partition is not currently resident
-    /// (so reconcile can treat its on-disk segments as immutable rather than
-    /// forcing a load, which would reset the in-memory watermark to `None`),
-    /// or `Some(watermark)` when resident.
-    pub(crate) async fn resident_sealed_ix(
+    /// Read a partition's in-memory active (live writeable) segment index
+    /// *without* loading it into memory.
+    ///
+    /// Returns `None` when the partition is not currently resident;
+    /// `Some(None)` when resident but with no active segment in memory (e.g.
+    /// loaded only for reads); and `Some(Some(ix))` when resident and actively
+    /// writing segment `ix`. The active segment is the only one whose on-disk
+    /// size may legitimately run ahead of the manifest — everything below it is
+    /// finalized and immutable.
+    pub(crate) async fn resident_active_ix(
         &self,
         partition_name: &str,
     ) -> Option<Option<SegmentIndex>> {
-        self.partitions
-            .read()
-            .await
-            .get(partition_name)
-            .map(|partition| partition.sealed_ix())
+        let partitions = self.partitions.read().await;
+        match partitions.get(partition_name) {
+            Some(partition) => Some(partition.active_data().await.map(|data| data.index)),
+            None => None,
+        }
     }
 
     pub async fn get_partition(&self, partition_name: &str) -> RwLockReadGuard<'_, Partition> {

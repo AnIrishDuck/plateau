@@ -400,22 +400,22 @@ impl Catalog {
         }
     }
 
-    /// Read a partition's `sealed_ix` watermark *without* loading the topic or
-    /// partition into memory.
+    /// Read a partition's in-memory active (live writeable) segment index
+    /// *without* loading the topic or partition into memory.
     ///
     /// Returns `None` when the partition (or its topic) is not currently
     /// resident: a non-resident partition is quiescent — no writer can extend
-    /// its tail, and a future reopen begins a brand-new segment — so every
-    /// persisted segment is immutable. Returns `Some(watermark)` when resident,
-    /// where `watermark` is the in-memory `sealed_ix` (segments at or below it
-    /// are durably sealed).
-    pub async fn resident_sealed_ix(
+    /// any segment, and a future reopen begins a brand-new segment — so every
+    /// persisted segment is immutable. Returns `Some(None)` when resident with
+    /// no active segment (e.g. loaded only for reads), and `Some(Some(ix))`
+    /// when resident and actively writing segment `ix`.
+    pub async fn resident_active_ix(
         &self,
         topic: &str,
         partition: &str,
     ) -> Option<Option<SegmentIndex>> {
         let state = self.state.read().await;
-        state.topics.get(topic)?.resident_sealed_ix(partition).await
+        state.topics.get(topic)?.resident_active_ix(partition).await
     }
 
     /// Returns true if the Catalog is not accepting log writes.
