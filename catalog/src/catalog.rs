@@ -327,19 +327,46 @@ impl Catalog {
         ByteSize::b(self.manifest.get_size(Scope::Global).await as u64)
     }
 
-    pub fn total_byte_limit(&self) -> ByteSize {
+    /// The number of partitions currently held in memory with an active
+    /// (unsealed) segment. Each of these may grow by up to one full segment
+    /// before it rolls, so retention reserves room for them (see
+    /// [Catalog::preallocated_room]).
+    pub async fn active_partitions(&self) -> usize {
+        let topics = &self.state.read().await.topics;
+        let mut count = 0;
+        for topic in topics.values() {
+            count += topic.active_data().await.len();
+        }
+        count
+    }
+
+    /// Room reserved for the active (in-memory) partitions during retention.
+    ///
+    /// Every active partition can accumulate up to a full segment's worth of
+    /// data before that segment rolls and becomes eligible for retention. We
+    /// reserve `max_segment_bytes * active_partitions` so the retention budget
+    /// leaves space for that in-flight growth rather than only accounting for
+    /// data already on disk.
+    pub async fn preallocated_room(&self) -> ByteSize {
+        let max_segment_bytes = self.config.partition.roll.max_bytes.0;
+        let active = self.active_partitions().await as u64;
+        ByteSize(max_segment_bytes.saturating_mul(active))
+    }
+
+    pub async fn total_byte_limit(&self) -> ByteSize {
         ByteSize(
             self.config
                 .retain
                 .max_bytes
                 .0
-                .saturating_sub(self.config.headroom.0),
+                .saturating_sub(self.config.headroom.0)
+                .saturating_sub(self.preallocated_room().await.0),
         )
     }
 
     async fn over_retention_limit(&self) -> bool {
         let size = self.byte_size().await;
-        let limit = self.total_byte_limit();
+        let limit = self.total_byte_limit().await;
         debug!(?limit, "catalog size: {}", size);
         gauge!("stored_size_bytes").set(size.as_u64() as f64);
         let over = size > limit;
@@ -511,12 +538,11 @@ impl Catalog {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::data::limit::Rolling;
     use crate::data::records::{build_records, Record};
     use crate::data::RecordIndex;
     use anyhow::Result;
     use chrono::{TimeDelta, TimeZone, Timelike, Utc};
-    use futures::stream;
-    use futures::stream::StreamExt;
     use std::slice;
     use tempfile::{tempdir, TempDir};
     use test_log::test;
@@ -524,14 +550,6 @@ mod test {
     impl Catalog {
         async fn active_topics(&self) -> usize {
             self.state.read().await.topics.len()
-        }
-
-        async fn active_partitions(&self) -> usize {
-            stream::iter(self.state.read().await.topics.iter())
-                .fold(0, |acc, (_, topic)| async move {
-                    acc + topic.active_data().await.len()
-                })
-                .await
         }
     }
 
@@ -635,6 +653,9 @@ mod test {
         let (_root, mut catalog) = catalog().await;
         catalog.config.retain.max_bytes = ByteSize::b(8000 + catalog.manifest.db_bytes() as u64);
         catalog.config.headroom = ByteSize::b(0);
+        // Neutralize per-partition preallocated room so this test exercises only
+        // the disk-size accounting (see Catalog::preallocated_room).
+        catalog.config.partition.roll.max_bytes = ByteSize::b(0);
 
         let data = "x".to_string().repeat(500);
 
@@ -661,12 +682,60 @@ mod test {
             partition.extend_records(&records).await?;
         }
 
-        assert!(catalog.byte_size().await > catalog.total_byte_limit());
+        assert!(catalog.byte_size().await > catalog.total_byte_limit().await);
         catalog.retain().await;
-        assert!(catalog.byte_size().await < catalog.total_byte_limit());
+        assert!(catalog.byte_size().await < catalog.total_byte_limit().await);
         let topic = catalog.get_topic("oldest").await;
         let partition = topic.get_partition("default").await;
         assert!(partition.byte_size().await < old_size);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_preallocated_room() -> Result<()> {
+        let segment_bytes = ByteSize::mib(100);
+        let (_root, mut catalog) = catalog_config(Config {
+            headroom: ByteSize::b(0),
+            partition: partition::Config {
+                roll: Rolling {
+                    max_bytes: segment_bytes,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        // `retain` is derived from `retention` on attach, so set the budget
+        // afterwards (as test_retain does).
+        catalog.config.retain.max_bytes = ByteSize::gib(1);
+
+        // With nothing in memory, no room is reserved and the limit is the full
+        // budget (headroom is zero here).
+        assert_eq!(catalog.active_partitions().await, 0);
+        assert_eq!(catalog.preallocated_room().await, ByteSize::b(0));
+        assert_eq!(catalog.total_byte_limit().await, ByteSize::gib(1));
+
+        // Activate two partitions in memory.
+        let records = build_records((0..4).map(|_| (0, "x".repeat(64))));
+        for name in ["topic-a", "topic-b"] {
+            let topic = catalog.get_topic(name).await;
+            let partition = topic.get_partition("default").await;
+            partition.extend_records(&records).await?;
+        }
+
+        // Each active partition reserves one full segment's worth of room, and
+        // that room is removed from the retention budget.
+        assert_eq!(catalog.active_partitions().await, 2);
+        assert_eq!(
+            catalog.preallocated_room().await,
+            ByteSize::b(2 * segment_bytes.as_u64())
+        );
+        assert_eq!(
+            catalog.total_byte_limit().await,
+            ByteSize::b(ByteSize::gib(1).as_u64() - 2 * segment_bytes.as_u64())
+        );
 
         Ok(())
     }
